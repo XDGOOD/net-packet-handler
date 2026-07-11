@@ -1,7 +1,28 @@
+# FIX: было single-stage, всё под root, без .dockerignore — в финальном
+# образе оставались build-essential/cmake и весь исходный контекст.
+# Теперь двухступенчатая сборка: собираем в builder-образе,
+# в рантайм-образ копируем только готовые бинарники, процесс идёт
+# от непривилегированного пользователя.
+
+FROM ubuntu:22.04 AS builder
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake libssl-dev libsqlite3-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY CMakeLists.txt server.cpp client.cpp ./
+RUN cmake . && make -j"$(nproc)"
+
 FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y build-essential cmake libssl-dev libsqlite3-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 libsqlite3-0 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --no-create-home --shell /usr/sbin/nologin aegis
+
 WORKDIR /app
-COPY . .
-RUN cmake . && make
+COPY --from=builder /build/aegis_server ./aegis_server
+RUN mkdir -p /app/data && chown -R aegis:aegis /app
+
+USER aegis
 CMD ["./aegis_server"]
