@@ -14,29 +14,30 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <openssl/rand.h>
+#include <openssl/kdf.h>
+#include "tun_interface.h"
+#include "handshake.h"
+#include "ip_pool.h"
+#include <optional>
+#include <memory>
+#include <poll.h>
 
-const std::string MAGIC = "AEGS";
+// --- AEGS Protocol v2 Constants ---
+const std::string VER_MAGIC = "AG2\x01";
 
-// --- Buffer sizing (см. server.cpp) ----------------------------------------
-// FIX: та же ошибка, что была на сервере — pbuf/cbuf были ровно BUFFER_SIZE,
-// а в них пишется 2-байтовый префикс длины + payload + паддинг + AEAD tag.
-// При len близком к максимуму UDP это переполняло буфер.
-const size_t BUFFER_SIZE = 65535;
-const size_t PAD_MIN = 16;
-const size_t PAD_MAX = 128;   // соответствует исходному 16 + rand()%113
+const size_t BUFFER_SIZE = 64000;
+const size_t PAD_MIN = 32;
+const size_t PAD_MAX = 256;
 const size_t FRAME_HDR = 2;
 const size_t TAG_LEN = 16;
-const size_t INTERNAL_BUF_SIZE = BUFFER_SIZE + FRAME_HDR + PAD_MAX + TAG_LEN + 64;
+const size_t INTERNAL_BUF_SIZE = 65535;
 
 const int PBKDF2_ITERATIONS = 200000;
 
-// FIX: kid по-прежнему просто SHA256(token)[0:8] — это публичный
-// идентификатор, ему не нужна медленная KDF. А вот сам ключ шифрования
-// теперь идёт через PBKDF2 с солью = hex(kid), синхронно с server.cpp,
-// иначе они просто перестанут понимать друг друга.
-void compute_key_id(const std::string& token, uint8_t* kid_out /*8 bytes*/, std::string& kid_hex_out) {
-    SHA256_CTX s; SHA256_Init(&s); SHA256_Update(&s, token.c_str(), token.length());
-    uint8_t full[32]; SHA256_Final(full, &s);
+void compute_key_id(const std::string& token, uint8_t* kid_out, std::string& kid_hex_out) {
+    uint8_t full[32];
+    unsigned int dlen = 32;
+    EVP_Digest(token.c_str(), token.length(), full, &dlen, EVP_sha256(), nullptr);
     std::memcpy(kid_out, full, 8);
     char hex[17];
     for (int i = 0; i < 8; ++i) sprintf(&hex[i * 2], "%02x", kid_out[i]);
@@ -44,10 +45,43 @@ void compute_key_id(const std::string& token, uint8_t* kid_out /*8 bytes*/, std:
     kid_hex_out = hex;
 }
 
-bool derive_key(const std::string& token, const std::string& salt, uint8_t* key_out) {
+bool derive_master_key(const std::string& token, const std::string& salt, uint8_t* master_key_out) {
     return PKCS5_PBKDF2_HMAC(token.c_str(), (int)token.length(),
                               reinterpret_cast<const unsigned char*>(salt.c_str()), (int)salt.length(),
-                              PBKDF2_ITERATIONS, EVP_sha256(), 32, key_out) == 1;
+                              PBKDF2_ITERATIONS, EVP_sha256(), 32, master_key_out) == 1;
+}
+
+bool hkdf_expand(const uint8_t* master_key, size_t master_key_len, const std::string& info, uint8_t* out, size_t out_len) {
+    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
+    if (!pctx) return false;
+    if (EVP_PKEY_derive_init(pctx) <= 0 ||
+        EVP_PKEY_CTX_set_hkdf_md(pctx, EVP_sha256()) <= 0 ||
+        EVP_PKEY_CTX_set1_hkdf_salt(pctx, (const unsigned char*)"aegis-v2-salt", 13) <= 0 ||
+        EVP_PKEY_CTX_set1_hkdf_key(pctx, master_key, (int)master_key_len) <= 0 ||
+        EVP_PKEY_CTX_add1_hkdf_info(pctx, (const unsigned char*)info.data(), (int)info.size()) <= 0 ||
+        EVP_PKEY_derive(pctx, out, &out_len) <= 0) {
+        EVP_PKEY_CTX_free(pctx);
+        return false;
+    }
+    EVP_PKEY_CTX_free(pctx);
+    return true;
+}
+
+bool mask_unmask_header(const uint8_t* in, size_t len, const uint8_t* mask_key, const uint8_t* hdr_iv, uint8_t* out) {
+    uint8_t full_iv[16] = {0};
+    std::memcpy(full_iv + 4, hdr_iv, 12);
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return false;
+    int outlen = 0;
+    if (EVP_CipherInit_ex(ctx, EVP_chacha20(), NULL, mask_key, full_iv, 1) != 1 ||
+        EVP_CipherUpdate(ctx, out, &outlen, in, (int)len) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+    int final_len = 0;
+    EVP_CipherFinal_ex(ctx, out + outlen, &final_len);
+    EVP_CIPHER_CTX_free(ctx);
+    return true;
 }
 
 bool chacha20_poly1305_encrypt(const uint8_t* pt, size_t pt_len, const uint8_t* key, const uint8_t* nonce, uint8_t* ct, size_t& ct_len) {
@@ -90,18 +124,23 @@ bool chacha20_poly1305_decrypt(const uint8_t* ct, size_t ct_len, const uint8_t* 
     EVP_CIPHER_CTX_free(ctx); return true;
 }
 
-// FIX: простая защита от replay на входящих от сервера пакетах —
-// раньше её не было вообще, атакующий мог повторно прогнать перехваченный
-// (валидный) зашифрованный пакет и продублировать трафик в локальный wg-core.
-class NonceCache {
-    std::unordered_set<std::string> cache;
-    std::queue<std::string> history;
+class AntiReplayFilter {
+    uint64_t last_seq = 0;
+    uint64_t bitmap = 0;
 public:
-    bool seen_or_add(const uint8_t* n) {
-        std::string s((const char*)n, 12);
-        if (cache.count(s)) return true;
-        cache.insert(s); history.push(s);
-        if (cache.size() > 1000) { cache.erase(history.front()); history.pop(); }
+    bool check_and_update(uint64_t seq) {
+        if (seq == 0) return true;
+        if (seq > last_seq) {
+            uint64_t diff = seq - last_seq;
+            if (diff < 64) bitmap = (bitmap << diff) | 1ULL;
+            else bitmap = 1ULL;
+            last_seq = seq;
+            return false;
+        }
+        uint64_t diff = last_seq - seq;
+        if (diff >= 64) return true;
+        if (bitmap & (1ULL << diff)) return true;
+        bitmap |= (1ULL << diff);
         return false;
     }
 };
@@ -111,102 +150,262 @@ size_t secure_pad_len() {
     return PAD_MIN + (b % (PAD_MAX - PAD_MIN + 1));
 }
 
+uint16_t generate_junk_len() {
+    uint8_t b; RAND_bytes(&b, 1);
+    if (b < 50) return 16 + (b % 49);
+    return 0;
+}
+
 void usage(const char* argv0) {
-    std::cerr << "usage: " << argv0 << " --server <host> --token <token> [--port <local_port>]\n";
+    std::cerr << "usage: " << argv0 << " <server_ip> <server_port> <token> [--no-tun]\n";
 }
 
 int main(int argc, char* argv[]) {
-    std::string s_host, token;
-    int l_port = 51821;
-
-    for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--server") && i + 1 < argc) s_host = argv[++i];
-        else if (!strcmp(argv[i], "--token") && i + 1 < argc) token = argv[++i];
-        else if (!strcmp(argv[i], "--port") && i + 1 < argc) l_port = atoi(argv[++i]);
-        else { usage(argv[0]); return 1; }
+    if (argc < 4) { usage(argv[0]); return 1; }
+    
+    std::string s_host = argv[1];
+    int s_port = std::stoi(argv[2]);
+    std::string token = argv[3];
+    bool use_tun = true;
+    for (int i = 4; i < argc; ++i) {
+        if (!strcmp(argv[i], "--no-tun")) use_tun = false;
     }
-    if (s_host.empty() || token.empty()) { usage(argv[0]); return 1; }
 
     uint8_t raw_kid[8];
     std::string kid_hex;
     compute_key_id(token, raw_kid, kid_hex);
 
-    uint8_t key[32];
-    if (!derive_key(token, kid_hex, key)) {
-        std::cerr << "key derivation failed\n";
+    uint8_t master_key[32];
+    if (!derive_master_key(token, kid_hex, master_key)) {
+        std::cerr << "master key derivation failed\n";
+        return 1;
+    }
+
+    uint8_t mask_key[32], fallback_payload_key[32];
+    if (!hkdf_expand(master_key, 32, "aegis-v2-header-mask", mask_key, 32) ||
+        !hkdf_expand(master_key, 32, "aegis-v2-payload-key", fallback_payload_key, 32)) {
+        std::cerr << "HKDF expansion failed\n";
         return 1;
     }
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) { perror("socket"); return 1; }
 
-    struct sockaddr_in l_addr {};
-    l_addr.sin_family = AF_INET; l_addr.sin_addr.s_addr = inet_addr("127.0.0.1"); l_addr.sin_port = htons(l_port);
-    if (bind(fd, (struct sockaddr*)&l_addr, sizeof(l_addr)) < 0) { perror("bind"); return 1; }
+    int sock_buf_size = 4 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sock_buf_size, sizeof(sock_buf_size));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sock_buf_size, sizeof(sock_buf_size));
 
-    // FIX: gethostbyname устарел/не потокобезопасен -> getaddrinfo, как на сервере.
+    if (!use_tun) {
+        struct sockaddr_in l_addr {};
+        l_addr.sin_family = AF_INET; l_addr.sin_addr.s_addr = inet_addr("127.0.0.1"); l_addr.sin_port = htons(51821);
+        if (bind(fd, (struct sockaddr*)&l_addr, sizeof(l_addr)) < 0) { perror("bind"); return 1; }
+    }
+
     struct sockaddr_in s_addr {};
-    s_addr.sin_family = AF_INET; s_addr.sin_port = htons(50001);
-    {
-        struct addrinfo hints {}, *res = nullptr;
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_DGRAM;
-        if (getaddrinfo(s_host.c_str(), nullptr, &hints, &res) == 0 && res) {
-            s_addr.sin_addr = reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr;
-            freeaddrinfo(res);
-        } else if (inet_pton(AF_INET, s_host.c_str(), &s_addr.sin_addr) != 1) {
-            std::cerr << "failed to resolve " << s_host << "\n";
-            return 1;
+    s_addr.sin_family = AF_INET; s_addr.sin_port = htons(s_port);
+    struct addrinfo hints {}, *res = nullptr;
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(s_host.c_str(), nullptr, &hints, &res) == 0 && res) {
+        s_addr.sin_addr = reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr;
+        freeaddrinfo(res);
+    } else if (inet_pton(AF_INET, s_host.c_str(), &s_addr.sin_addr) != 1) {
+        std::cerr << "failed to resolve " << s_host << "\n";
+        return 1;
+    }
+
+    // AEGS v3 Handshake
+    HandshakeClient hc(raw_kid, nullptr);
+    std::vector<uint8_t> init_pkt = hc.build_init();
+    sendto(fd, init_pkt.data(), init_pkt.size(), 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
+
+    SessionKeys session_keys;
+    uint32_t assigned_ip = 0;
+    uint32_t mtu = 1420;
+    bool handshake_ok = false;
+
+    struct pollfd pfd;
+    pfd.fd = fd; pfd.events = POLLIN;
+    if (poll(&pfd, 1, 5000) > 0) {
+        struct sockaddr_in src; socklen_t slen = sizeof(src);
+        std::vector<uint8_t> resp(BUFFER_SIZE);
+        ssize_t len = recvfrom(fd, resp.data(), resp.size(), 0, (struct sockaddr*)&src, &slen);
+        if (len > 0) {
+            if (hc.process_resp(resp.data(), len, session_keys)) {
+                assigned_ip = session_keys.assigned_ip;
+                mtu = session_keys.mtu;
+                handshake_ok = true;
+                std::cout << "[AEGS v3] Handshake successful. IP: " << IpPool::to_string(assigned_ip) << "\n";
+            }
         }
     }
 
-    struct sockaddr_in wg_addr {}; bool has_wg = false;
-    NonceCache seen_nonces;
+    if (!handshake_ok) {
+        std::cout << "[AEGS v3] Handshake failed/timeout. Falling back to v2 derived keys.\n";
+        std::memcpy(session_keys.send_key, fallback_payload_key, 32);
+        std::memcpy(session_keys.recv_key, fallback_payload_key, 32);
+    }
 
-    // FIX: внутренние буферы с запасом, см. INTERNAL_BUF_SIZE выше.
+    std::unique_ptr<TunInterface> tun;
+    if (use_tun) {
+        std::string ip_cidr = IpPool::to_string(assigned_ip) + "/24";
+        tun = std::make_unique<TunInterface>("aegs0", ip_cidr, mtu);
+        if (tun->open()) {
+            tun->add_route("0.0.0.0/0");
+            std::cout << "[AEGS v3] TUN interface ready: aegs0 = " << ip_cidr << "\n";
+        } else {
+            std::cerr << "Failed to open TUN interface.\n";
+            return 1;
+        }
+    } else {
+        std::cout << "[AEGS v2 Client] Obfuscated tunnel active. SOCKS/WG proxy on 127.0.0.1:51821\n";
+    }
+
+    struct sockaddr_in wg_addr {}; bool has_wg = false;
+    AntiReplayFilter replay_filter;
+    uint64_t client_tx_seq = 0;
+
     std::vector<uint8_t> buf(BUFFER_SIZE);
     std::vector<uint8_t> pbuf(INTERNAL_BUF_SIZE);
     std::vector<uint8_t> cbuf(INTERNAL_BUF_SIZE);
 
+    std::vector<struct pollfd> pfds;
+    struct pollfd pfd_udp; pfd_udp.fd = fd; pfd_udp.events = POLLIN; pfd_udp.revents = 0;
+    pfds.push_back(pfd_udp);
+    if (use_tun && tun) {
+        struct pollfd pfd_tun; pfd_tun.fd = tun->fd(); pfd_tun.events = POLLIN; pfd_tun.revents = 0;
+        pfds.push_back(pfd_tun);
+    }
+
     while (true) {
-        struct sockaddr_in src; socklen_t slen = sizeof(src);
-        ssize_t len = recvfrom(fd, buf.data(), buf.size(), 0, (struct sockaddr*)&src, &slen);
-        if (len <= 0) continue;
+        int poll_ret = poll(pfds.data(), pfds.size(), 1000);
+        if (poll_ret < 0) break;
+        if (poll_ret == 0) continue;
 
-        if (src.sin_addr.s_addr == s_addr.sin_addr.s_addr && src.sin_port == s_addr.sin_port) {
-            // пакет от aegis-сервера -> расшифровать и отдать локальному wg-core
-            if (len < 24 || std::memcmp(buf.data(), MAGIC.data(), 4) != 0) continue;
-            const uint8_t* nonce = buf.data() + 12;
-            if (seen_nonces.seen_or_add(nonce)) continue;
+        // UDP fd readable
+        if (pfds[0].revents & POLLIN) {
+            struct sockaddr_in src; socklen_t slen = sizeof(src);
+            ssize_t len = recvfrom(fd, buf.data(), buf.size(), 0, (struct sockaddr*)&src, &slen);
+            if (len > 0 && src.sin_addr.s_addr == s_addr.sin_addr.s_addr && src.sin_port == s_addr.sin_port) {
+                if (len < 56) continue;
 
-            size_t dlen = 0;
-            if (chacha20_poly1305_decrypt(buf.data() + 24, len - 24, key, nonce, pbuf.data(), dlen)) {
-                if (dlen < 2) continue;
-                uint16_t plen = (pbuf[0] << 8) | pbuf[1];
-                if (has_wg && plen <= dlen - 2) sendto(fd, pbuf.data() + 2, plen, 0, (struct sockaddr*)&wg_addr, sizeof(wg_addr));
+                const uint8_t* hdr_iv = buf.data();
+                uint8_t unmasked_hdr[16];
+                if (!mask_unmask_header(buf.data() + 12, 16, mask_key, hdr_iv, unmasked_hdr)) continue;
+
+                if (std::memcmp(unmasked_hdr, raw_kid, 8) != 0) continue;
+                if (std::memcmp(unmasked_hdr + 12, VER_MAGIC.data(), 4) != 0) continue;
+
+                uint16_t junk_len = (unmasked_hdr[8] << 8) | unmasked_hdr[9];
+                size_t aead_offset = 12 + 16 + junk_len;
+                if (len < aead_offset + 12 + TAG_LEN) continue;
+
+                const uint8_t* aead_nonce = buf.data() + aead_offset;
+                uint64_t rx_seq = 0;
+                std::memcpy(&rx_seq, aead_nonce, sizeof(uint64_t));
+                if (replay_filter.check_and_update(rx_seq)) continue;
+
+                const uint8_t* ct = buf.data() + aead_offset + 12;
+                size_t ct_len = len - (aead_offset + 12);
+
+                size_t dlen = 0;
+                if (chacha20_poly1305_decrypt(ct, ct_len, session_keys.recv_key, aead_nonce, pbuf.data(), dlen)) {
+                    if (dlen < 2) continue;
+                    uint16_t plen = (pbuf[0] << 8) | pbuf[1];
+                    if (use_tun) {
+                        tun->write_packet(pbuf.data() + 2, plen);
+                    } else if (has_wg && plen <= dlen - 2) {
+                        sendto(fd, pbuf.data() + 2, plen, 0, (struct sockaddr*)&wg_addr, sizeof(wg_addr));
+                    }
+                }
+            } else if (len > 0 && !use_tun) {
+                // Packet from local WireGuard
+                wg_addr = src; has_wg = true;
+                
+                size_t pad_len = secure_pad_len();
+                size_t frame_len = FRAME_HDR + (size_t)len + pad_len;
+                if (frame_len + TAG_LEN > pbuf.size()) { pad_len = 0; frame_len = FRAME_HDR + (size_t)len; }
+
+                uint16_t plen_be = htons((uint16_t)len);
+                std::memcpy(pbuf.data(), &plen_be, 2);
+                std::memcpy(pbuf.data() + 2, buf.data(), len);
+                if (pad_len > 0) RAND_bytes(pbuf.data() + 2 + len, (int)pad_len);
+
+                uint8_t aead_nonce[12] = {0};
+                client_tx_seq++;
+                std::memcpy(aead_nonce, &client_tx_seq, sizeof(uint64_t));
+                RAND_bytes(aead_nonce + 8, 4);
+
+                size_t elen = 0;
+                if (!chacha20_poly1305_encrypt(pbuf.data(), frame_len, session_keys.send_key, aead_nonce, cbuf.data(), elen)) continue;
+
+                uint16_t junk_len = generate_junk_len();
+
+                uint8_t hdr_plain[16];
+                std::memcpy(hdr_plain, raw_kid, 8);
+                hdr_plain[8] = (junk_len >> 8) & 0xFF;
+                hdr_plain[9] = junk_len & 0xFF;
+                hdr_plain[10] = 0; hdr_plain[11] = 0;
+                std::memcpy(hdr_plain + 12, VER_MAGIC.data(), 4);
+
+                uint8_t hdr_iv[12]; RAND_bytes(hdr_iv, 12);
+                uint8_t masked_hdr[16];
+                if (!mask_unmask_header(hdr_plain, 16, mask_key, hdr_iv, masked_hdr)) continue;
+
+                static thread_local std::vector<uint8_t> out_buf(BUFFER_SIZE);
+                size_t out_len = 0;
+                std::memcpy(out_buf.data(), hdr_iv, 12); out_len += 12;
+                std::memcpy(out_buf.data() + out_len, masked_hdr, 16); out_len += 16;
+                if (junk_len > 0) { RAND_bytes(out_buf.data() + out_len, (int)junk_len); out_len += junk_len; }
+                std::memcpy(out_buf.data() + out_len, aead_nonce, 12); out_len += 12;
+                std::memcpy(out_buf.data() + out_len, cbuf.data(), elen); out_len += elen;
+
+                sendto(fd, out_buf.data(), out_len, 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
             }
-        } else {
-            // пакет от локального wg-core -> зашифровать и отправить на сервер
-            wg_addr = src; has_wg = true;
+        }
 
-            size_t pad_len = secure_pad_len();
-            size_t frame_len = FRAME_HDR + (size_t)len + pad_len;
-            if (frame_len + TAG_LEN > pbuf.size()) { pad_len = 0; frame_len = FRAME_HDR + (size_t)len; }
+        // TUN fd readable
+        if (use_tun && tun && (pfds[1].revents & POLLIN)) {
+            ssize_t len = tun->read_packet(buf.data(), buf.size());
+            if (len > 0) {
+                size_t pad_len = secure_pad_len();
+                size_t frame_len = FRAME_HDR + (size_t)len + pad_len;
+                if (frame_len + TAG_LEN > pbuf.size()) { pad_len = 0; frame_len = FRAME_HDR + (size_t)len; }
 
-            uint16_t plen_be = htons((uint16_t)len);
-            std::memcpy(pbuf.data(), &plen_be, 2);
-            std::memcpy(pbuf.data() + 2, buf.data(), len);
-            if (pad_len > 0) RAND_bytes(pbuf.data() + 2 + len, (int)pad_len);
+                uint16_t plen_be = htons((uint16_t)len);
+                std::memcpy(pbuf.data(), &plen_be, 2);
+                std::memcpy(pbuf.data() + 2, buf.data(), len);
+                if (pad_len > 0) RAND_bytes(pbuf.data() + 2 + len, (int)pad_len);
 
-            uint8_t nonce[12]; RAND_bytes(nonce, 12);
-            size_t elen = 0;
-            if (chacha20_poly1305_encrypt(pbuf.data(), frame_len, key, nonce, cbuf.data(), elen)) {
-                std::vector<uint8_t> out; out.reserve(24 + elen);
-                out.insert(out.end(), MAGIC.begin(), MAGIC.end());
-                out.insert(out.end(), raw_kid, raw_kid + 8);
-                out.insert(out.end(), nonce, nonce + 12);
-                out.insert(out.end(), cbuf.begin(), cbuf.begin() + elen);
-                sendto(fd, out.data(), out.size(), 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
+                uint8_t aead_nonce[12] = {0};
+                client_tx_seq++;
+                std::memcpy(aead_nonce, &client_tx_seq, sizeof(uint64_t));
+                RAND_bytes(aead_nonce + 8, 4);
+
+                size_t elen = 0;
+                if (!chacha20_poly1305_encrypt(pbuf.data(), frame_len, session_keys.send_key, aead_nonce, cbuf.data(), elen)) continue;
+
+                uint16_t junk_len = generate_junk_len();
+
+                uint8_t hdr_plain[16];
+                std::memcpy(hdr_plain, raw_kid, 8);
+                hdr_plain[8] = (junk_len >> 8) & 0xFF;
+                hdr_plain[9] = junk_len & 0xFF;
+                hdr_plain[10] = 0; hdr_plain[11] = 0;
+                std::memcpy(hdr_plain + 12, VER_MAGIC.data(), 4);
+
+                uint8_t hdr_iv[12]; RAND_bytes(hdr_iv, 12);
+                uint8_t masked_hdr[16];
+                if (!mask_unmask_header(hdr_plain, 16, mask_key, hdr_iv, masked_hdr)) continue;
+
+                static thread_local std::vector<uint8_t> out_buf(BUFFER_SIZE);
+                size_t out_len = 0;
+                std::memcpy(out_buf.data(), hdr_iv, 12); out_len += 12;
+                std::memcpy(out_buf.data() + out_len, masked_hdr, 16); out_len += 16;
+                if (junk_len > 0) { RAND_bytes(out_buf.data() + out_len, (int)junk_len); out_len += junk_len; }
+                std::memcpy(out_buf.data() + out_len, aead_nonce, 12); out_len += 12;
+                std::memcpy(out_buf.data() + out_len, cbuf.data(), elen); out_len += elen;
+
+                sendto(fd, out_buf.data(), out_len, 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
             }
         }
     }
