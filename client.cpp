@@ -213,36 +213,57 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // AEGS v3 Handshake
-    HandshakeClient hc(raw_kid, nullptr);
-    std::vector<uint8_t> init_pkt = hc.build_init();
-    sendto(fd, init_pkt.data(), init_pkt.size(), 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
-
+    // AEGS v3 Handshake with retry
+    // FIX CRIT-4: No silent downgrade to PSK. An active MITM who can drop
+    // packets will ALWAYS trigger any fallback that exists — losing PFS.
+    // Instead, retry the handshake up to 3 times, then fail explicitly.
+    const int HANDSHAKE_MAX_RETRIES = 3;
     SessionKeys session_keys;
     uint32_t assigned_ip = 0;
     uint32_t mtu = 1420;
     bool handshake_ok = false;
 
-    struct pollfd pfd;
-    pfd.fd = fd; pfd.events = POLLIN;
-    if (poll(&pfd, 1, 5000) > 0) {
-        struct sockaddr_in src; socklen_t slen = sizeof(src);
-        std::vector<uint8_t> resp(BUFFER_SIZE);
-        ssize_t len = recvfrom(fd, resp.data(), resp.size(), 0, (struct sockaddr*)&src, &slen);
-        if (len > 0) {
-            if (hc.process_resp(resp.data(), len, session_keys)) {
+    for (int attempt = 0; attempt < HANDSHAKE_MAX_RETRIES && !handshake_ok; ++attempt) {
+        // FIX CRIT-2: Pass master_key (secret) to HandshakeClient, not nullptr.
+        // The old code passed nullptr as server_pubkey, causing UB (memcpy from NULL)
+        // and a MAC computed on garbage → handshake would always fail or crash.
+        HandshakeClient hc(raw_kid, master_key);
+        std::vector<uint8_t> init_pkt = hc.build_init();
+        if (init_pkt.empty()) {
+            std::cerr << "[AEGS v3] Failed to build handshake init packet\n";
+            close(fd);
+            return 1;
+        }
+        sendto(fd, init_pkt.data(), init_pkt.size(), 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
+
+        struct pollfd pfd;
+        pfd.fd = fd; pfd.events = POLLIN;
+        if (poll(&pfd, 1, 5000) > 0) {
+            struct sockaddr_in src; socklen_t slen = sizeof(src);
+            std::vector<uint8_t> resp(BUFFER_SIZE);
+            ssize_t len = recvfrom(fd, resp.data(), resp.size(), 0, (struct sockaddr*)&src, &slen);
+            if (len > 0 && hc.process_resp(resp.data(), len, session_keys)) {
                 assigned_ip = session_keys.assigned_ip;
                 mtu = session_keys.mtu;
                 handshake_ok = true;
                 std::cout << "[AEGS v3] Handshake successful. IP: " << IpPool::to_string(assigned_ip) << "\n";
             }
         }
+        if (!handshake_ok && attempt < HANDSHAKE_MAX_RETRIES - 1) {
+            std::cerr << "[AEGS v3] Handshake attempt " << (attempt + 1) << " failed, retrying...\n";
+        }
     }
 
     if (!handshake_ok) {
-        std::cout << "[AEGS v3] Handshake failed/timeout. Falling back to v2 derived keys.\n";
-        std::memcpy(session_keys.send_key, fallback_payload_key, 32);
-        std::memcpy(session_keys.recv_key, fallback_payload_key, 32);
+        // FIX CRIT-4: Explicit failure instead of silent PSK fallback.
+        // Falling back to pre-shared symmetric keys would:
+        //   1. Lose Perfect Forward Secrecy (the whole point of ECDH handshake)
+        //   2. Use the same key for send and recv (breaks context separation)
+        //   3. Be trivially forced by any active attacker who drops HANDSHAKE_RESP
+        std::cerr << "[AEGS v3] ERROR: Handshake failed after " << HANDSHAKE_MAX_RETRIES
+                  << " attempts. Aborting — PSK fallback disabled (would lose PFS).\n";
+        close(fd);
+        return 1;
     }
 
     std::unique_ptr<TunInterface> tun;
@@ -250,7 +271,8 @@ int main(int argc, char* argv[]) {
         std::string ip_cidr = IpPool::to_string(assigned_ip) + "/24";
         tun = std::make_unique<TunInterface>("aegs0", ip_cidr, mtu);
         if (tun->open()) {
-            tun->add_route("0.0.0.0/0");
+            // FIX: Removed tun->add_route("0.0.0.0/0"); 
+            // Routing 0.0.0.0/0 into TUN without a bypass route for the server IP causes an infinite routing loop and BSOD!
             std::cout << "[AEGS v3] TUN interface ready: aegs0 = " << ip_cidr << "\n";
         } else {
             std::cerr << "Failed to open TUN interface.\n";

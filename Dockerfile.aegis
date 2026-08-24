@@ -19,7 +19,7 @@ RUN apk add --no-cache \
 
 WORKDIR /build
 
-COPY CMakeLists.txt server.cpp client.cpp ./
+COPY CMakeLists.txt *.cpp *.h ./
 
 RUN cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \

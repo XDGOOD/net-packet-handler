@@ -65,6 +65,10 @@ services:
       - ./data:/app/data
     security_opt:
       - no-new-privileges:true
+    # FIX MED-2: AEGS v3 creates TUN interface (aegs0) and manages iptables
+    # NAT rules — both require NET_ADMIN. Without it, the server crashes on startup.
+    cap_add:
+      - NET_ADMIN
     cap_drop:
       - ALL
     sysctls:

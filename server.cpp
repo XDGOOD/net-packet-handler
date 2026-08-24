@@ -300,6 +300,9 @@ int main() {
     }
     
     std::unordered_map<uint64_t, std::string> user_map;
+    // FIX CRIT-1: Build master_key_map so HandshakeServer can verify MAC
+    // using user's MasterKey (secret), not the server's public key.
+    std::unordered_map<uint64_t, std::vector<uint8_t>> master_key_map;
     for (auto& kv : sessions) {
         uint64_t kid = 0;
         for (int i = 0; i < 8; i++) {
@@ -308,6 +311,8 @@ int main() {
             ((uint8_t*)&kid)[i] = (uint8_t)b;
         }
         user_map[kid] = kv.first; 
+        master_key_map[kid] = std::vector<uint8_t>(
+            kv.second->master_key, kv.second->master_key + 32);
     }
     
     TunInterface tun("aegs0", "10.8.0.1/24", 1400);
@@ -326,7 +331,7 @@ int main() {
     }
 
     IpPool ip_pool("10.8.0.0/24");
-    HandshakeServer hs_server(user_map);
+    HandshakeServer hs_server(user_map, master_key_map);
     auto server_pubkey = hs_server.get_pubkey();
 
     int server_fd = socket(AF_INET, SOCK_DGRAM, 0);

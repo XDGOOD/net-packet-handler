@@ -7,6 +7,14 @@
 #include <mutex>
 #include <string>
 
+// FIX CRIT-5: Upper bounds for pre-authentication state to prevent DoS
+// via handshake flooding. Values chosen to allow legitimate burst traffic
+// while capping memory: 1024 * ~40 bytes ≈ 40KB for pending_clients,
+// 100000 * 8 bytes ≈ 800KB for seen_timestamps.
+static constexpr size_t MAX_PENDING_CLIENTS = 1024;
+static constexpr size_t MAX_SEEN_TIMESTAMPS = 100000;
+static constexpr uint64_t PENDING_CLIENT_TTL_MS = 30000; // 30 seconds
+
 struct SessionKeys {
     uint8_t send_key[32];
     uint8_t recv_key[32];
@@ -21,29 +29,40 @@ typedef struct evp_pkey_st EVP_PKEY;
 
 class HandshakeClient {
 public:
-    HandshakeClient(const uint8_t key_id[8], const uint8_t server_pubkey[32]);
+    // FIX CRIT-1/CRIT-2: Takes master_key (per-user secret derived from token)
+    // for HMAC authentication, NOT server_pubkey (which is public knowledge and
+    // provides zero authentication — any attacker who knows the pubkey could
+    // forge a valid HANDSHAKE_INIT without the token).
+    HandshakeClient(const uint8_t key_id[8], const uint8_t master_key[32]);
     ~HandshakeClient();
 
     std::vector<uint8_t> build_init();
+    // FIX CRIT-3: process_resp now expects 80-byte response (was 64)
+    // to include 16-byte AEAD tag for config encryption authentication.
     bool process_resp(const uint8_t* resp, size_t len, SessionKeys& out);
 
 private:
     uint8_t m_key_id[8];
-    uint8_t m_server_pubkey[32];
+    uint8_t m_master_key[32]; // FIX CRIT-1: was m_server_pubkey (public, not a secret)
     EVP_PKEY* m_ephemeral_pkey;
 };
 
 class HandshakeServer {
 public:
-    HandshakeServer(const std::unordered_map<uint64_t, std::string>& user_map);
+    // FIX CRIT-1: Now takes master_key_map (key_id → 32-byte master key) so that
+    // process_init can verify MAC using the user's secret, not the server pubkey.
+    HandshakeServer(const std::unordered_map<uint64_t, std::string>& user_map,
+                    const std::unordered_map<uint64_t, std::vector<uint8_t>>& master_key_map);
     ~HandshakeServer();
 
     bool process_init(const uint8_t* init, size_t len, uint64_t& key_id_out);
+    // FIX CRIT-3: build_resp now returns 80-byte response (was 64)
     std::vector<uint8_t> build_resp(uint64_t key_id, uint32_t assigned_ip, uint16_t mtu, SessionKeys& out);
     std::vector<uint8_t> get_pubkey() const;
 
 private:
     std::unordered_map<uint64_t, std::string> m_user_map;
+    std::unordered_map<uint64_t, std::vector<uint8_t>> m_master_keys; // FIX CRIT-1
     EVP_PKEY* m_static_pkey;
 
     std::mutex m_mutex;
@@ -58,4 +77,8 @@ private:
 
     void load_or_generate_key();
     void prune_timestamps();
+    // FIX CRIT-5: Evict stale pending handshake states that exceeded TTL.
+    // Without this, m_pending_clients grows unbounded if clients never
+    // complete the handshake (e.g. attacker sends INIT but never reads RESP).
+    void prune_pending(uint64_t now_ms);
 };

@@ -32,22 +32,25 @@ Offset  Len  Field
 8       8    KeyID = SHA-256(Token)[:8]
 16      32   ClientEphemeralPublicKey (X25519)
 48      8    Timestamp_ms (uint64 big-endian, Unix ms)
-56      16   MAC = HMAC-SHA256(ServerStaticPubKey, bytes[0:56])[:16]
+56      16   MAC = HMAC-SHA256(MasterKey, bytes[0:56])[:16]
 ```
 
 Security properties:
+- MAC authenticates that the sender knows the per-user Token (via MasterKey)
 - Timestamp within ±30 seconds (anti-replay)
-- Server rejects duplicate timestamps
+- Server rejects duplicate timestamps (sliding window, bounded at 100k entries)
+- Pending handshake states bounded at 1024 with 30-second TTL (DoS protection)
 
 ### 4.2 HANDSHAKE_RESP (Server → Client)
-Byte layout (64 bytes):
+Byte layout (80 bytes):
 ```
 Offset  Len  Field
 0       1    Type = 0x02
 1       7    Reserved = 0x00...
 8       8    SessionID (random uint64)
 16      32   ServerEphemeralPublicKey (X25519)
-48      16   EncryptedConfig = ChaCha20({AssignedIP[4], MTU[2], zeros[10]})
+48      16   EncryptedConfig = ChaCha20-Poly1305({AssignedIP[4], MTU[2], zeros[10]})
+64      16   AEAD_Tag (Poly1305 authentication tag for EncryptedConfig)
 ```
 
 ### 4.3 Session Key Derivation
@@ -57,6 +60,7 @@ C2S_Key = HKDF(SharedSecret, salt=KeyID, info="aegs-c2s", len=32)
 S2C_Key = HKDF(SharedSecret, salt=KeyID, info="aegs-s2c", len=32)
 ```
 Provides Perfect Forward Secrecy: session keys are ephemeral and not recoverable from Token.
+No fallback to pre-shared keys — handshake failure results in explicit abort with retry.
 
 ## 5. Data Packet Format
 
