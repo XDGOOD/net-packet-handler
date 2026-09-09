@@ -29,13 +29,16 @@
 #include "nat_manager.h"
 #include "blackhole_responder.h"
 #include "traffic_shaper.h"
+#include "port_hopper.h"
+#include "session_resumption.h"
+#include "session_table.h"
+#include "aegs_config.h"
 
 // --- AEGS Protocol v2 Constants ---
 // AWG v1/v2/v3 Obfuscation & Noise Architecture + VLESS-REALITY Mimicry
 const std::string VER_MAGIC = "AG2\x01"; // 4-byte internal magic post unmasking
 const std::string WG_HOST = "wg-core";
 const int WG_PORT = 51820;
-const std::string DB_PATH = "/app/data/aegis.db";
 const int MAX_EVENTS = 1024;
 
 const size_t BUFFER_SIZE = 64000;
@@ -168,6 +171,7 @@ struct Session {
     uint32_t assigned_ip = 0;    // NEW: assigned TUN IP (host byte order)
     SessionKeys session_keys;    // NEW: ECDH-derived per-session keys
     bool v3_handshake_done = false; // NEW: true after ECDH handshake complete
+    int last_server_fd = -1;
 
     bool check_replay(const uint8_t* n_bytes) {
         uint64_t seq = 0;
@@ -226,6 +230,7 @@ bool set_nonblocking(int fd) {
 
 // Global BlackholeResponder for anti active-probing
 BlackholeResponder g_blackhole;
+ResumptionManager g_resumption;
 
 // Blackhole-enhanced probing fallback: generates varied QUIC-like responses
 void send_probing_fallback(int fd, const struct sockaddr_in& caddr,
@@ -273,8 +278,9 @@ uint16_t generate_junk_len() {
 }
 
 int main() {
+    AegsConfig cfg = AegsConfig::from_env();
     sqlite3* db;
-    if (sqlite3_open(DB_PATH.c_str(), &db) == SQLITE_OK) {
+    if (sqlite3_open(cfg.db_path.c_str(), &db) == SQLITE_OK) {
         sqlite3_stmt* stmt;
         if (sqlite3_prepare_v2(db, "SELECT aegis_key_id, aegis_token FROM users", -1, &stmt, NULL) == SQLITE_OK) {
             while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -296,7 +302,7 @@ int main() {
         }
         sqlite3_close(db);
     } else {
-        std::cerr << "failed to open db at " << DB_PATH << ": " << sqlite3_errmsg(db) << "\n";
+        std::cerr << "failed to open db at " << cfg.db_path << ": " << sqlite3_errmsg(db) << "\n";
         return 1;
     }
 
@@ -321,7 +327,7 @@ int main() {
             kv.second->master_key, kv.second->master_key + 32);
     }
     
-    TunInterface tun("aegs0", "10.8.0.1/24", 1400);
+    TunInterface tun(cfg.tun_name, cfg.tun_addr(), cfg.mtu);
     if (!tun.open()) {
         std::cerr << "[AEGS v3] Failed to create TUN interface aegs0\n";
         return 1;
@@ -343,25 +349,33 @@ int main() {
     TrafficShaper shaper(5, false);
     shaper.set_semantic_enabled(true);
 
-    int server_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (server_fd < 0) { perror("socket"); return 1; }
-    if (!set_nonblocking(server_fd)) { perror("fcntl"); return 1; }
-
-    int sock_buf_size = 4 * 1024 * 1024; // 4MB socket buffer for high throughput
-    setsockopt(server_fd, SOL_SOCKET, SO_RCVBUF, &sock_buf_size, sizeof(sock_buf_size));
-    setsockopt(server_fd, SOL_SOCKET, SO_SNDBUF, &sock_buf_size, sizeof(sock_buf_size));
-    int reuse = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    struct sockaddr_in saddr {};
-    saddr.sin_family = AF_INET; saddr.sin_addr.s_addr = INADDR_ANY; saddr.sin_port = htons(50001);
-    if (bind(server_fd, (struct sockaddr*)&saddr, sizeof(saddr)) < 0) { perror("bind"); return 1; }
-
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) { perror("epoll_create1"); return 1; }
     struct epoll_event ev {}, events[MAX_EVENTS];
-    ev.events = EPOLLIN; ev.data.fd = server_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
+
+    PortHopper hopper(cfg.base_port, cfg.port_count, cfg.hop_interval_sec);
+    auto ports = hopper.server_ports();
+
+    std::vector<int> server_fds;
+    std::unordered_set<int> server_fd_set; // for O(1) lookup in epoll loop
+    for (uint16_t port : ports) {
+        int sfd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sfd < 0) { perror("socket"); return 1; }
+        if (!set_nonblocking(sfd)) { perror("fcntl"); return 1; }
+        int sock_buf_size = 4 * 1024 * 1024;
+        setsockopt(sfd, SOL_SOCKET, SO_RCVBUF, &sock_buf_size, sizeof(sock_buf_size));
+        setsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &sock_buf_size, sizeof(sock_buf_size));
+        int reuse = 1;
+        setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        struct sockaddr_in sa {};
+        sa.sin_family = AF_INET; sa.sin_addr.s_addr = INADDR_ANY; sa.sin_port = htons(port);
+        if (bind(sfd, (struct sockaddr*)&sa, sizeof(sa)) < 0) { perror("bind"); return 1; }
+        struct epoll_event ev_s {};
+        ev_s.events = EPOLLIN; ev_s.data.fd = sfd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sfd, &ev_s);
+        server_fds.push_back(sfd);
+        server_fd_set.insert(sfd);
+    }
     
     int tun_fd = tun.fd();
     ev.events = EPOLLIN; ev.data.fd = tun_fd;
@@ -371,7 +385,7 @@ int main() {
     std::vector<uint8_t> dec_buf(INTERNAL_BUF_SIZE);
     std::vector<uint8_t> enc_buf(INTERNAL_BUF_SIZE);
 
-    std::cout << "[AEGS v2/v3 Server] Epoll obfuscated listener active on 0.0.0.0:50001\n";
+    std::cout << "[AEGS v4 Server] Port Hopping active on ports " << cfg.base_port << "-" << (cfg.base_port + cfg.port_count - 1) << " (" << cfg.port_count << " ports, " << cfg.hop_interval_sec << "s interval)\n";
 
     while (true) {
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
@@ -381,7 +395,7 @@ int main() {
         for (int i = 0; i < nfds; ++i) {
             int fd = events[i].data.fd;
 
-            if (fd == server_fd) {
+            if (server_fd_set.count(fd)) {
                 struct sockaddr_in caddr; socklen_t clen = sizeof(caddr);
                 ssize_t len = recvfrom(fd, buffer.data(), buffer.size(), 0, (struct sockaddr*)&caddr, &clen);
                 if (len < 0) continue;
@@ -390,6 +404,38 @@ int main() {
                 auto ban_it = banned_ips.find(ip);
                 if (ban_it != banned_ips.end() && now < ban_it->second) continue;
 
+                if (buffer[0] == 0x04 && (size_t)len >= 97) {
+                    ResumptionToken rtok;
+                    memcpy(&rtok, buffer.data() + 1, 96);
+                    uint64_t resumed_sid = 0;
+                    uint32_t resumed_ip = 0;
+                    // Try to verify against all users' master keys
+                    for (auto& kv : sessions) {
+                        if (g_resumption.verify(rtok, kv.second->master_key, resumed_sid, resumed_ip)) {
+                            Session* s = kv.second;
+                            // Restore session
+                            s->client_addr = caddr;
+                            s->has_client = true;
+                            s->last_activity = now;
+                            s->last_server_fd = fd;
+                            if (resumed_ip && !s->assigned_ip) {
+                                s->assigned_ip = resumed_ip;
+                                ip_to_session[s->assigned_ip] = s;
+                            }
+                            // Send new resumption token for next reconnect
+                            ResumptionToken new_tok;
+                            if (g_resumption.issue(s->session_id, s->assigned_ip, s->master_key, new_tok)) {
+                                uint8_t rpkt[97];
+                                rpkt[0] = 0x03;
+                                memcpy(rpkt + 1, &new_tok, 96);
+                                sendto(fd, rpkt, 97, 0, (struct sockaddr*)&caddr, sizeof(caddr));
+                            }
+                            std::cout << "[RESUME] Session resumed for " << ip << " (" << IpPool::to_string(s->assigned_ip) << ")\n";
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 if (buffer[0] == 0x01 && (size_t)len >= 72) {
                     uint64_t key_id_out = 0;
                     if (hs_server.process_init(buffer.data(), len, key_id_out)) {
@@ -413,15 +459,25 @@ int main() {
                             s->has_client = true;
                             s->v3_handshake_done = true;
                             s->last_activity = now;
-                            sendto(server_fd, resp.data(), resp.size(), 0, (struct sockaddr*)&caddr, sizeof(caddr));
+                            s->last_server_fd = fd;
+                            sendto(fd, resp.data(), resp.size(), 0, (struct sockaddr*)&caddr, sizeof(caddr));
                             std::cout << "[HS] Client " << ip << " assigned " << IpPool::to_string(s->assigned_ip) << "\n";
+                            
+                            ResumptionToken rtok;
+                            if (g_resumption.issue(s->session_id, s->assigned_ip, s->master_key, rtok)) {
+                                uint8_t rtok_pkt[97];
+                                rtok_pkt[0] = 0x03; // RESUMPTION_TOKEN
+                                memcpy(rtok_pkt + 1, &rtok, 96);
+                                sendto(fd, rtok_pkt, 97, 0, (struct sockaddr*)&caddr, sizeof(caddr));
+                                std::cout << "[HS] Resumption token issued for " << ip << "\n";
+                            }
                         }
                     }
                     continue;
                 }
 
                 // AEGS v2 Min Outer Size: HDR_IV(12) + MASKED_HDR(16) + AEAD_IV(12) + TAG(16) = 56 bytes
-                if (len < 56) { record_fail(server_fd, caddr, buffer.data(), (size_t)len, ip, now, 1.0); continue; }
+                if (len < 56) { record_fail(fd, caddr, buffer.data(), (size_t)len, ip, now, 1.0); continue; }
 
                 const uint8_t* hdr_iv = buffer.data();
                 Session* matched_sess = nullptr;
@@ -441,13 +497,13 @@ int main() {
                     }
                 }
 
-                if (!matched_sess) { record_fail(server_fd, caddr, buffer.data(), (size_t)len, ip, now, 1.0); continue; }
+                if (!matched_sess) { record_fail(fd, caddr, buffer.data(), (size_t)len, ip, now, 1.0); continue; }
 
                 Session* s = matched_sess;
 
                 uint16_t junk_len = (unmasked_hdr[8] << 8) | unmasked_hdr[9];
                 size_t aead_offset = 12 + 16 + junk_len;
-                if ((size_t)len < aead_offset + 12 + TAG_LEN) { record_fail(server_fd, caddr, buffer.data(), (size_t)len, ip, now, 0.5); continue; }
+                if ((size_t)len < aead_offset + 12 + TAG_LEN) { record_fail(fd, caddr, buffer.data(), (size_t)len, ip, now, 0.5); continue; }
 
                 const uint8_t* aead_nonce = buffer.data() + aead_offset;
                 if (s->check_replay(aead_nonce)) continue;
@@ -458,7 +514,7 @@ int main() {
                 size_t dec_len = 0;
                 const uint8_t* dec_key = s->v3_handshake_done ? s->session_keys.send_key : s->payload_key;
                 if (!chacha20_poly1305_decrypt(ct, ct_len, dec_key, aead_nonce, dec_buf.data(), dec_len)) {
-                    record_fail(server_fd, caddr, buffer.data(), (size_t)len, ip, now, 0.5); continue;
+                    record_fail(fd, caddr, buffer.data(), (size_t)len, ip, now, 0.5); continue;
                 }
 
                 // Authentication passed! Securely update roaming endpoint.
@@ -538,7 +594,7 @@ int main() {
                         std::memcpy(out_buf.data() + out_len, aead_nonce, 12); out_len += 12;
                         std::memcpy(out_buf.data() + out_len, enc_buf.data(), enc_len); out_len += enc_len;
 
-                        sendto(server_fd, out_buf.data(), out_len, 0, (struct sockaddr*)&s->client_addr, sizeof(s->client_addr));
+                        sendto(s->last_server_fd, out_buf.data(), out_len, 0, (struct sockaddr*)&s->client_addr, sizeof(s->client_addr));
                     }
                 }
             }

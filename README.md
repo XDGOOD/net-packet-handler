@@ -1,6 +1,6 @@
 # AEGS v4 "Pantheon" — Autonomous Encrypted Gateway System
 
-[![Tests](https://img.shields.io/badge/Tests-9%2F9%20Pillars%20PASS-brightgreen.svg)](#)
+[![Tests](https://img.shields.io/badge/Tests-11%2F11%20Pillars%20PASS-brightgreen.svg)](#)
 [![Language](https://img.shields.io/badge/Language-C%2B%2B17-blue.svg)](#)
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)](#)
 [![Version](https://img.shields.io/badge/Version-4.0%20Pantheon-orange.svg)](#)
@@ -43,6 +43,16 @@ AEGS v4 is an advanced transport protocol specifically engineered to defeat both
 
 ---
 
+### 5. Port Hopping (Active DPI Evasion)
+* **Problem:** DPI blocks specific UDP ports when VPN traffic is suspected.
+* **Solution:** Server binds to multiple ports. Client uses HMAC-SHA256 to deterministically hop ports every `hop_interval` seconds based on the session key.
+
+### 6. Session Resumption (Zero-RTT Reconnect)
+* **Problem:** ECDH handshakes are expensive and slow down reconnections.
+* **Solution:** Server issues an encrypted, AEAD-authenticated 96-byte `ResumptionToken`. Client sends a `RESUME` packet to reconnect in <5ms.
+
+---
+
 ## 📊 Comparison Table: AEGS v4 Pantheon vs Competitors
 
 | Feature | WireGuard | AmneziaWG 3.1 | XTLS-Reality | **AEGS v4 Pantheon** |
@@ -58,9 +68,9 @@ AEGS v4 is an advanced transport protocol specifically engineered to defeat both
 
 ---
 
-## 🧪 9-Pillar Test Suite
+## 🧪 11-Pillar Test Suite
 
-The project includes a comprehensive 9-Pillar verification suite:
+The project includes a comprehensive 11-Pillar verification suite:
 * **Pillar 1:** Cryptographic Context Separation (HKDF-SHA256, 200k PBKDF2 iterations)
 * **Pillar 2:** Shannon Entropy (>7.2 / 8.0 on wire, indistinguishable from white noise)
 * **Pillar 3:** RFC 6479 64-bit Anti-Replay Sliding Window & 100% Poly1305 tamper detection
@@ -113,6 +123,6 @@ cd net-packet-handler
 * `traffic_shaper.h/cpp` — Semantic padding (bimodal distribution) and microsecond send jitter.
 * `chaff_engine.h/cpp` — Active chaffing generation and idle timing engine.
 * `blackhole_responder.h/cpp` — Cryptographic blackhole response generator for probe deterrence.
-* `test_runner.cpp` — Native C++ 9-Pillar test suite.
-* `test_suite_v4.py` — Standalone Python 9-Pillar verification runner.
+* `test_runner.cpp` — Native C++ 11-Pillar test suite.
+* `test_suite_v4.py` — Standalone Python 11-Pillar verification runner.
 * `scripts/quick_client.py` — Cross-platform client supervisor and WireGuard proxy.

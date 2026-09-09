@@ -21,6 +21,8 @@
 #include "illusion_prebypass.h"
 #include "chaff_engine.h"
 #include "traffic_shaper.h"
+#include "port_hopper.h"
+#include "session_resumption.h"
 #include <optional>
 #include <memory>
 #include <poll.h>
@@ -271,6 +273,18 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    int port_count = 10;
+    int hop_interval = 30;
+    const char* pc_env = std::getenv("AEGS_PORT_COUNT");
+    const char* hi_env = std::getenv("AEGS_HOP_INTERVAL");
+    if (pc_env) port_count = std::atoi(pc_env);
+    if (hi_env) hop_interval = std::atoi(hi_env);
+    PortHopper hopper((uint16_t)s_port, port_count, (uint32_t)hop_interval);
+    std::cout << "[AEGS v4] Port hopping active: base=" << s_port << " count=" << port_count << " interval=" << hop_interval << "s\n";
+
+    ResumptionToken resumption_token;
+    bool has_resumption_token = false;
+
     std::unique_ptr<TunInterface> tun;
     if (use_tun) {
         std::string ip_cidr = IpPool::to_string(assigned_ip) + "/24";
@@ -314,6 +328,7 @@ int main(int argc, char* argv[]) {
         if (chaff_engine.should_send_chaff()) {
             std::vector<uint8_t> chaff_pkt = chaff_engine.build_chaff_packet(raw_kid, mask_key, session_keys.send_key, client_tx_seq);
             if (!chaff_pkt.empty()) {
+                s_addr.sin_port = htons(hopper.current_port(session_keys.send_key));
                 sendto(fd, chaff_pkt.data(), chaff_pkt.size(), 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
             }
         }
@@ -324,7 +339,17 @@ int main(int argc, char* argv[]) {
         if (pfds[0].revents & POLLIN) {
             struct sockaddr_in src; socklen_t slen = sizeof(src);
             ssize_t len = recvfrom(fd, buf.data(), buf.size(), 0, (struct sockaddr*)&src, &slen);
-            if (len > 0 && src.sin_addr.s_addr == s_addr.sin_addr.s_addr && src.sin_port == s_addr.sin_port) {
+            uint16_t src_port = ntohs(src.sin_port);
+            bool port_ok = (src_port >= (uint16_t)s_port && src_port < (uint16_t)(s_port + port_count));
+            if (len > 0 && src.sin_addr.s_addr == s_addr.sin_addr.s_addr && port_ok) {
+                // Check for resumption token from server
+                if (len >= 97 && buf[0] == 0x03) {
+                    memcpy(&resumption_token, buf.data() + 1, 96);
+                    has_resumption_token = true;
+                    std::cout << "[AEGS v4] Resumption token received\n";
+                    continue;
+                }
+
                 if (len < 56) continue;
 
                 const uint8_t* hdr_iv = buf.data();
@@ -398,6 +423,7 @@ int main(int argc, char* argv[]) {
                 std::memcpy(out_buf.data() + out_len, aead_nonce, 12); out_len += 12;
                 std::memcpy(out_buf.data() + out_len, cbuf.data(), elen); out_len += elen;
 
+                s_addr.sin_port = htons(hopper.current_port(session_keys.send_key));
                 sendto(fd, out_buf.data(), out_len, 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
                 chaff_engine.mark_real_packet();
             }
@@ -445,6 +471,7 @@ int main(int argc, char* argv[]) {
                 std::memcpy(out_buf.data() + out_len, aead_nonce, 12); out_len += 12;
                 std::memcpy(out_buf.data() + out_len, cbuf.data(), elen); out_len += elen;
 
+                s_addr.sin_port = htons(hopper.current_port(session_keys.send_key));
                 sendto(fd, out_buf.data(), out_len, 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
                 chaff_engine.mark_real_packet();
             }

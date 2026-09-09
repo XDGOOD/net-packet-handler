@@ -166,7 +166,49 @@ Module: `blackhole_responder.h/cpp`
 | Variable length | Semantic padding + random junk per packet |
 | No timing pattern | Chaff engine + epoll-based, no sleep() in hot path |
 
-## 9. Security Considerations
+## 11. Port Hopping (Active DPI Evasion)
+
+AEGS v4 rotates the active UDP port every `hop_interval` seconds using HMAC-SHA256:
+
+```
+epoch = floor(time() / hop_interval)
+hmac = HMAC-SHA256(session_key, epoch_be64)
+port = base_port + (le32(hmac[0:4]) % port_count)
+```
+
+**Properties:**
+- Server binds all ports simultaneously (base_port to base_port + count - 1)
+- Client deterministically predicts the active port
+- Different sessions hop on different schedules (key-dependent)
+- Boundary window: client tries both current and next epoch port during transitions
+
+**Wire format unchanged** — port hopping is purely at the transport layer.
+
+## 12. Session Resumption (Zero-RTT Reconnect)
+
+After successful ECDH handshake, server issues a **ResumptionToken** (96 bytes):
+
+| Field | Size | Description |
+|-------|------|-------------|
+| nonce | 32 B | Random nonce |
+| ciphertext | 32 B | Encrypted: session_id(8) + ip(4) + expiry_ms(8) + zeros(12) |
+| tag | 16 B | Poly1305 AEAD tag |
+| reserved | 16 B | Zero-padded, future use |
+
+**Encryption:** ChaCha20-Poly1305, key derived via HKDF(master_key, "aegs-v4-resumption-key")
+
+**Protocol flow:**
+1. Client sends `RESUME` packet: `0x04 || token[96]` (97 bytes)
+2. Server verifies token, restores session state
+3. Server issues new token for next reconnect
+4. Reconnect completes in <5ms (vs ~1s full handshake)
+
+**Security:**
+- Anti-replay: server tracks used nonces
+- Expiry: 3-minute TTL
+- AEAD authentication prevents forgery
+
+## 13. Security Considerations
 - Token brute-force: 200,000 PBKDF2 iterations (~1s on modern CPU)
 - DoS: rate limiter (5 responses/sec per IP), IP banning after 10 weight points
 - Replay: RFC 6479 64-bit window

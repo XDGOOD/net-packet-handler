@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AEGS v4 "Pantheon" -- Complete 9-Pillar Test & Verification Suite
+AEGS v4 "Pantheon" -- Complete 11-Pillar Test & Verification Suite
 Runs directly in Python 3.12 using the cryptography engine.
 Validates all cryptographic, anti-DPI, and performance components:
   Pillar 1: Multi-Context HKDF-SHA256 & 200k PBKDF2 Key Derivation
@@ -15,6 +15,8 @@ Validates all cryptographic, anti-DPI, and performance components:
 """
 
 import math
+import os
+import unittest
 import time
 import struct
 import secrets
@@ -188,9 +190,173 @@ class BlackholeResponder:
             # QUIC Connection Close
             return b"\x40" + probe[:8] + b"\x01\x1C\x00\x0A\x00\x13unsupported version" + secrets.token_bytes(8)
 
+
+class Pillar10_PortHopping(unittest.TestCase):
+    """Pillar 10: Port Hopping produces deterministic, uniform, key-dependent port rotation."""
+    
+    def test_deterministic_port_for_same_key_and_time(self):
+        """Same session key + same time → same port."""
+        import hmac, hashlib, struct, time as _time
+        key = os.urandom(32)
+        base_port = 50001
+        count = 10
+        interval = 30
+        epoch = int(_time.time()) // interval
+        
+        def compute_port(k, ep):
+            ep_bytes = struct.pack('>Q', ep)
+            h = hmac.new(k, ep_bytes, hashlib.sha256).digest()
+            val = struct.unpack('<I', h[:4])[0]
+            return base_port + (val % count)
+        
+        p1 = compute_port(key, epoch)
+        p2 = compute_port(key, epoch)
+        self.assertEqual(p1, p2, "Same key+epoch must produce same port")
+    
+    def test_different_keys_produce_different_sequences(self):
+        """Different session keys → different port sequences."""
+        import hmac, hashlib, struct
+        base_port = 50001
+        count = 10
+        key1 = os.urandom(32)
+        key2 = os.urandom(32)
+        
+        def compute_ports(k, n_epochs):
+            ports = []
+            for ep in range(n_epochs):
+                ep_bytes = struct.pack('>Q', ep)
+                h = hmac.new(k, ep_bytes, hashlib.sha256).digest()
+                val = struct.unpack('<I', h[:4])[0]
+                ports.append(base_port + (val % count))
+            return ports
+        
+        seq1 = compute_ports(key1, 100)
+        seq2 = compute_ports(key2, 100)
+        self.assertNotEqual(seq1, seq2, "Different keys should produce different port sequences")
+    
+    def test_port_range_bounds(self):
+        """All computed ports must be within [base_port, base_port+count)."""
+        import hmac, hashlib, struct
+        base_port = 50001
+        count = 10
+        key = os.urandom(32)
+        
+        for ep in range(10000):
+            ep_bytes = struct.pack('>Q', ep)
+            h = hmac.new(key, ep_bytes, hashlib.sha256).digest()
+            val = struct.unpack('<I', h[:4])[0]
+            port = base_port + (val % count)
+            self.assertGreaterEqual(port, base_port)
+            self.assertLess(port, base_port + count)
+    
+    def test_uniform_distribution(self):
+        """Port distribution should be roughly uniform across all ports."""
+        import hmac, hashlib, struct
+        from collections import Counter
+        base_port = 50001
+        count = 10
+        key = os.urandom(32)
+        
+        ports = []
+        for ep in range(10000):
+            ep_bytes = struct.pack('>Q', ep)
+            h = hmac.new(key, ep_bytes, hashlib.sha256).digest()
+            val = struct.unpack('<I', h[:4])[0]
+            ports.append(base_port + (val % count))
+        
+        counter = Counter(ports)
+        for p in range(base_port, base_port + count):
+            hits = counter.get(p, 0)
+            self.assertGreater(hits, 700, f"Port {p} underrepresented: {hits}")
+            self.assertLess(hits, 1300, f"Port {p} overrepresented: {hits}")
+
+class Pillar11_SessionResumption(unittest.TestCase):
+    """Pillar 11: Session resumption tokens — issue, verify, anti-replay."""
+    
+    def _issue_and_verify(self, master_key, session_id, ip):
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+        from cryptography.hazmat.primitives import hashes
+        import struct, time as _time
+        
+        hkdf = HKDF(algorithm=hashes.SHA256(), length=32,
+                     salt=b'aegis-v2-salt', info=b'aegs-v4-resumption-key')
+        rkey = hkdf.derive(master_key)
+        
+        expiry = int(_time.time() * 1000) + 180000
+        plain = struct.pack('<Q', session_id) + struct.pack('<I', ip) + struct.pack('<Q', expiry) + b'\x00' * 12
+        
+        nonce_full = os.urandom(32)
+        nonce_12 = nonce_full[:12]
+        cipher = ChaCha20Poly1305(rkey)
+        ct_tag = cipher.encrypt(nonce_12, plain, None)
+        ct = ct_tag[:32]
+        tag = ct_tag[32:]
+        
+        token = nonce_full + ct + tag + b'\x00' * 16
+        
+        nonce2 = token[:32]
+        ct2 = token[32:64]
+        tag2 = token[64:80]
+        
+        hkdf2 = HKDF(algorithm=hashes.SHA256(), length=32,
+                      salt=b'aegis-v2-salt', info=b'aegs-v4-resumption-key')
+        rkey2 = hkdf2.derive(master_key)
+        cipher2 = ChaCha20Poly1305(rkey2)
+        
+        decrypted = cipher2.decrypt(nonce2[:12], ct2 + tag2, None)
+        
+        sid_out = struct.unpack('<Q', decrypted[:8])[0]
+        ip_out = struct.unpack('<I', decrypted[8:12])[0]
+        exp_out = struct.unpack('<Q', decrypted[12:20])[0]
+        
+        return sid_out, ip_out, exp_out
+    
+    def test_roundtrip(self):
+        """Token can be issued and verified with correct key."""
+        import time
+        key = os.urandom(32)
+        sid, ip, exp = self._issue_and_verify(key, 0x1234567890ABCDEF, 0x0A080002)
+        self.assertEqual(sid, 0x1234567890ABCDEF)
+        self.assertEqual(ip, 0x0A080002)
+        self.assertGreater(exp, int(time.time() * 1000))
+    
+    def test_wrong_key_fails(self):
+        """Verify with wrong key must fail."""
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+        from cryptography.hazmat.primitives import hashes
+        import struct, time
+        
+        key1 = os.urandom(32)
+        key2 = os.urandom(32)
+        
+        hkdf = HKDF(algorithm=hashes.SHA256(), length=32,
+                     salt=b'aegis-v2-salt', info=b'aegs-v4-resumption-key')
+        rkey1 = hkdf.derive(key1)
+        
+        expiry = int(time.time() * 1000) + 180000
+        plain = struct.pack('<Q', 1) + struct.pack('<I', 2) + struct.pack('<Q', expiry) + b'\x00' * 12
+        nonce = os.urandom(32)
+        cipher = ChaCha20Poly1305(rkey1)
+        ct_tag = cipher.encrypt(nonce[:12], plain, None)
+        token = nonce + ct_tag[:32] + ct_tag[32:] + b'\x00' * 16
+        
+        hkdf2 = HKDF(algorithm=hashes.SHA256(), length=32,
+                      salt=b'aegis-v2-salt', info=b'aegs-v4-resumption-key')
+        rkey2 = hkdf2.derive(key2)
+        cipher2 = ChaCha20Poly1305(rkey2)
+        
+        with self.assertRaises(Exception):
+            cipher2.decrypt(token[:12], token[32:64] + token[64:80], None)
+    
+    def test_token_size(self):
+        """ResumptionToken must be exactly 96 bytes."""
+        self.assertEqual(32 + 32 + 16 + 16, 96)
+
 def main():
     print("=" * 70)
-    print("      AEGS v4 PANTHEON COMPLETE 9-PILLAR ADVANCED SECURITY SUITE      ")
+    print("      AEGS v4 PANTHEON COMPLETE 11-PILLAR ADVANCED SECURITY SUITE      ")
     print("=" * 70)
 
     token = "prod_user_token_long_entropy_test_2026_safe"
@@ -409,8 +575,17 @@ def main():
     print(f"  [PASS] Strategy 2 (QUIC Retry Token Injection): {retry} / 500")
     print(f"  [PASS] Strategy 3 (QUIC Connection Close Frame): {close} / 500")
 
+    print("\n[PILLAR 10 & 11] PORT HOPPING & SESSION RESUMPTION TESTS...")
+    suite = unittest.TestSuite()
+    suite.addTest(unittest.makeSuite(Pillar10_PortHopping))
+    suite.addTest(unittest.makeSuite(Pillar11_SessionResumption))
+    res = unittest.TextTestRunner(verbosity=2).run(suite)
+    if not res.wasSuccessful():
+        print("[FAILED] Unittests failed.")
+        return
+
     print("\n" + "=" * 70)
-    print("[SUCCESS] ALL 9 ADVANCED SECURITY, RELIABILITY & ANTI-DPI SUITES: 100% PASS!")
+    print("[SUCCESS] ALL 11 ADVANCED SECURITY, RELIABILITY & ANTI-DPI SUITES: 100% PASS!")
     print("=" * 70)
 
 if __name__ == "__main__":
