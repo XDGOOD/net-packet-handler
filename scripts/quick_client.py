@@ -72,13 +72,12 @@ if os.name == 'nt' and not os.environ.get('TERM'):
 def banner():
     print(f"{Colors.CYAN}{Colors.BOLD}")
     print(r"""
-    ___    ______ _____ ____         ____        __  __              
-   /   |  / ____// ___// __ \ _   __/ __ \__  __/ /_/ /_  ____  ____ 
-  / /| | / __/  / / _ / / / /| | / / /_/ / / / / __/ __ \/ __ \/ __ \
- / ___ |/ /___ / /_/ // /_/ / | |/ / ____/ /_/ / /_/ / / / /_/ / / / /
-/_/  |_/_____/ \____(_)____/  |___/_/    \__, /\__/_/ /_/\____/_/ /_/ 
-                                         /____/                        
-    Zero-DPI Obfuscated UDP Tunnel Proxy (WireGuard 127.0.0.1:51821)
+    ___    ______ _____ ____         ____             __  __                      
+   /   |  / ____// ___// __ \ _   __/ __ \____ _____ / /_/ /_  ___  ____  ____ 
+  / /| | / __/  / / _ / / / /| | / / /_/ / __ `/ __ \/ __/ __ \/ _ \/ __ \/ __ \
+ / ___ |/ /___ / /_/ // /_/ / | |/ / ____/ /_/ / / / / /_/ / / /  __/ /_/ / / / /
+/_/  |_/_____/ \____(_)____/  |___/_/    \__,_/_/ /_/\__/_/ /_/\___/\____/_/ /_/ 
+    AEGS v4 "Pantheon" — Zero-DPI Anti-ML Obfuscated UDP Tunnel (127.0.0.1:51821)
 """)
     print(f"{Colors.RESET}")
 
@@ -133,6 +132,54 @@ def mask_unmask_header(data: bytes, mask_key: bytes, hdr_iv: bytes) -> bytes:
     cipher = Cipher(algorithms.ChaCha20(mask_key, full_nonce), mode=None)
     encryptor = cipher.encryptor()
     return encryptor.update(data)
+
+def semantic_pad(payload_len: int) -> int:
+    """AEGS v4 Bimodal Semantic Shaping (Anti-ML traffic profile)."""
+    # 5% medium noise packet (512-768B)
+    if secrets.randbelow(100) < 5:
+        target = 512 + secrets.randbelow(257)
+        needed = FRAME_HDR + payload_len
+        return max(0, target - needed)
+
+    needed = FRAME_HDR + payload_len
+    if payload_len <= 200:
+        # Small packet: target ~256B (QUIC ACK profile)
+        jitter = secrets.randbelow(33) - 16
+        target = max(0, 256 + jitter)
+        return max(0, target - needed)
+    else:
+        # Large packet: target ~1350B (Full MTU QUIC frame)
+        if needed >= 1350:
+            return secrets.randbelow(33)
+        jitter = secrets.randbelow(65) - 32
+        target = max(0, 1350 + jitter)
+        return max(0, target - needed)
+
+def send_illusion_sequence(sock: socket.socket, server_addr: tuple[str, int]):
+    """AEGS v4 State-Machine Pre-Bypass: sends 1-3 STUN / QUIC Initial decoys."""
+    count = 1 + secrets.randbelow(3)
+    for _ in range(count):
+        if secrets.randbelow(2) == 0:
+            # RFC 5389 STUN Binding Request decoy
+            pkt = bytearray(20)
+            pkt[0:2] = b"\x00\x01"
+            pkt[4:8] = b"\x21\x12\xA4\x42" # Magic Cookie
+            pkt[8:20] = secrets.token_bytes(12)
+        else:
+            # RFC 9000 QUIC Initial decoy (>=1200 bytes)
+            pkt = bytearray(1200)
+            pkt[0] = 0xC3 # Long header Initial
+            pkt[1:5] = b"\x00\x00\x00\x01" # QUIC v1
+            pkt[5] = 8; pkt[6:14] = secrets.token_bytes(8)
+            pkt[14] = 8; pkt[15:23] = secrets.token_bytes(8)
+            pkt[24:26] = b"\x44\x92"
+            pkt[26:30] = secrets.token_bytes(4)
+            pkt[30:1200] = secrets.token_bytes(1170)
+        try:
+            sock.sendto(bytes(pkt), server_addr)
+            time.sleep(0.01 + secrets.randbelow(40) / 1000.0)
+        except OSError:
+            pass
 
 def find_native_binary() -> Path | None:
     """Searches for native compiled aegs-client binary."""
@@ -204,16 +251,24 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
     sock.bind(("127.0.0.1", local_port))
     sock.setblocking(False)
 
-    print(f"{Colors.GREEN}[OK] Python AEGS v2 Proxy Listener Active on 127.0.0.1:{local_port}{Colors.RESET}")
+    print(f"{Colors.GREEN}[OK] Python AEGS v4 Pantheon Proxy Active on 127.0.0.1:{local_port}{Colors.RESET}")
     print(f"     - Remote Server: {server_host} ({server_ip}:{DEFAULT_SERVER_PORT})")
     print(f"     - Key ID:        {kid_hex}")
-    print(f"     - WireGuard:     Set Endpoint = 127.0.0.1:{local_port}\n")
+    print(f"     - WireGuard:     Set Endpoint = 127.0.0.1:{local_port}")
+    print(f"     - Anti-DPI:      Illusion Pre-Bypass + Bimodal Shaping + Active Chaffing active\n")
+
+    # State-Machine Pre-Bypass: send STUN / QUIC Initial decoys before flow
+    print(f"{Colors.CYAN}[*] Sending State-Machine Pre-Bypass decoys (STUN / QUIC)...{Colors.RESET}")
+    send_illusion_sequence(sock, server_addr)
+    print(f"{Colors.GREEN}[OK] DPI State-Machine Pre-Bypass armed.{Colors.RESET}")
     print(f"{Colors.YELLOW}Proxying packets with Zero-DPI protection (Press Ctrl+C to stop)...{Colors.RESET}")
 
     wg_client_addr = None
     client_tx_seq = 0
     replay_last_seq = 0
     replay_bitmap = 0
+    last_real_packet = time.monotonic()
+    next_chaff_time = last_real_packet + 0.05 + secrets.randbelow(10) / 100.0
 
     def check_replay(seq: int) -> bool:
         nonlocal replay_last_seq, replay_bitmap
@@ -237,7 +292,28 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
 
     try:
         while True:
-            r, _, _ = select.select([sock], [], [], 1.0)
+            # Active Chaffing: send dummy packets if idle > 500ms
+            now = time.monotonic()
+            if (now - last_real_packet) > 0.50:
+                if now >= next_chaff_time:
+                    next_chaff_time = now + 0.05 + secrets.randbelow(15) / 100.0
+                    chaff_pad = 64 + secrets.randbelow(65)
+                    chaff_frame = b"\x00\x00" + secrets.token_bytes(chaff_pad)
+                    client_tx_seq += 1
+                    chaff_nonce = struct.pack("<Q", client_tx_seq) + secrets.token_bytes(4)
+                    chaff_ct = aead.encrypt(chaff_nonce, chaff_frame, None)
+                    chaff_hdr = bytearray(16)
+                    chaff_hdr[0:8] = raw_kid
+                    chaff_hdr[10] = 0x80 # CHAFF flag (silent drop on server)
+                    chaff_hdr[12:16] = VER_MAGIC
+                    chaff_iv = secrets.token_bytes(12)
+                    chaff_masked = mask_unmask_header(bytes(chaff_hdr), mask_key, chaff_iv)
+                    try:
+                        sock.sendto(chaff_iv + chaff_masked + chaff_nonce + chaff_ct, server_addr)
+                    except OSError:
+                        pass
+
+            r, _, _ = select.select([sock], [], [], 0.1)
             if not r:
                 continue
 
@@ -284,9 +360,12 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
             else:
                 # Outbound packet from local WireGuard -> encrypt & pad -> send to server
                 wg_client_addr = addr
+                last_real_packet = time.monotonic()
+                next_chaff_time = last_real_packet + 0.1
 
-                pad_len = PAD_MIN + (secrets.randbelow(PAD_MAX - PAD_MIN + 1))
                 plen = len(data)
+                # Bimodal Semantic Padding (~256B for ACKs, ~1350B for Full MTU)
+                pad_len = semantic_pad(plen)
                 frame = struct.pack(">H", plen) + data + secrets.token_bytes(pad_len)
 
                 client_tx_seq += 1
