@@ -18,6 +18,9 @@
 #include "tun_interface.h"
 #include "handshake.h"
 #include "ip_pool.h"
+#include "illusion_prebypass.h"
+#include "chaff_engine.h"
+#include "traffic_shaper.h"
 #include <optional>
 #include <memory>
 #include <poll.h>
@@ -214,6 +217,8 @@ int main(int argc, char* argv[]) {
     }
 
     // AEGS v3 Handshake with retry
+    IllusionPreBypass::send_illusion_sequence(fd, s_addr, raw_kid);
+
     // FIX CRIT-4: No silent downgrade to PSK. An active MITM who can drop
     // packets will ALWAYS trigger any fallback that exists — losing PFS.
     // Instead, retry the handshake up to 3 times, then fail explicitly.
@@ -298,9 +303,21 @@ int main(int argc, char* argv[]) {
         pfds.push_back(pfd_tun);
     }
 
+    ChaffEngine chaff_engine;
+    TrafficShaper shaper(5, false);
+    shaper.set_semantic_enabled(true);
+
     while (true) {
-        int poll_ret = poll(pfds.data(), pfds.size(), 1000);
+        int poll_ret = poll(pfds.data(), pfds.size(), 100);
         if (poll_ret < 0) break;
+
+        if (chaff_engine.should_send_chaff()) {
+            std::vector<uint8_t> chaff_pkt = chaff_engine.build_chaff_packet(raw_kid, mask_key, session_keys.send_key, client_tx_seq);
+            if (!chaff_pkt.empty()) {
+                sendto(fd, chaff_pkt.data(), chaff_pkt.size(), 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
+            }
+        }
+
         if (poll_ret == 0) continue;
 
         // UDP fd readable
@@ -343,7 +360,7 @@ int main(int argc, char* argv[]) {
                 // Packet from local WireGuard
                 wg_addr = src; has_wg = true;
                 
-                size_t pad_len = secure_pad_len();
+                size_t pad_len = shaper.semantic_pad((size_t)len);
                 size_t frame_len = FRAME_HDR + (size_t)len + pad_len;
                 if (frame_len + TAG_LEN > pbuf.size()) { pad_len = 0; frame_len = FRAME_HDR + (size_t)len; }
 
@@ -382,6 +399,7 @@ int main(int argc, char* argv[]) {
                 std::memcpy(out_buf.data() + out_len, cbuf.data(), elen); out_len += elen;
 
                 sendto(fd, out_buf.data(), out_len, 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
+                chaff_engine.mark_real_packet();
             }
         }
 
@@ -389,7 +407,7 @@ int main(int argc, char* argv[]) {
         if (use_tun && tun && (pfds[1].revents & POLLIN)) {
             ssize_t len = tun->read_packet(buf.data(), buf.size());
             if (len > 0) {
-                size_t pad_len = secure_pad_len();
+                size_t pad_len = shaper.semantic_pad((size_t)len);
                 size_t frame_len = FRAME_HDR + (size_t)len + pad_len;
                 if (frame_len + TAG_LEN > pbuf.size()) { pad_len = 0; frame_len = FRAME_HDR + (size_t)len; }
 
@@ -428,6 +446,7 @@ int main(int argc, char* argv[]) {
                 std::memcpy(out_buf.data() + out_len, cbuf.data(), elen); out_len += elen;
 
                 sendto(fd, out_buf.data(), out_len, 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
+                chaff_engine.mark_real_packet();
             }
         }
     }

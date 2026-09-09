@@ -10,7 +10,18 @@
 #include <openssl/rand.h>
 #include <openssl/kdf.h>
 #include <cmath>
+#include <thread>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
+#endif
+
+#include "traffic_shaper.h"
+#include "illusion_prebypass.h"
+#include "chaff_engine.h"
+#include "blackhole_responder.h"
 
 const std::string VER_MAGIC = "AG2\x01";
 const int PBKDF2_ITERATIONS = 200000;
@@ -308,8 +319,158 @@ int main() {
     std::cout << "  [PASS] Processing Speed: " << pps << " packets/sec" << std::endl;
     std::cout << "  [PASS] Real Sustained Throughput: " << mbps << " Mbit/s (Single Core)" << std::endl;
 
+    // -------------------------------------------------------------
+    // PILLAR 6: Semantic Bimodal Shaping & Anti-ML Distribution
+    // -------------------------------------------------------------
+    std::cout << "\n[PILLAR 6] SEMANTIC BIMODAL SHAPING & ANTI-ML EVALUATION..." << std::endl;
+    TrafficShaper sem_shaper(5, false);
+    sem_shaper.set_semantic_enabled(true);
+
+    int small_clustered = 0;
+    int large_clustered = 0;
+    int medium_noise = 0;
+    const int TEST_SAMPLES = 1000;
+
+    for (int i = 0; i < TEST_SAMPLES; ++i) {
+        // Small packet test (e.g. 40 to 120 bytes: ACK, DNS, TCP handshake)
+        size_t small_len = 40 + (i % 80);
+        size_t pad_small = sem_shaper.semantic_pad(small_len);
+        size_t total_small = FRAME_HDR + small_len + pad_small;
+        if (total_small >= 230 && total_small <= 280) {
+            small_clustered++;
+        } else if (total_small >= 500 && total_small <= 780) {
+            medium_noise++;
+        }
+
+        // Large packet test (e.g. 700 to 1100 bytes: video chunk, web assets)
+        size_t large_len = 700 + (i % 400);
+        size_t pad_large = sem_shaper.semantic_pad(large_len);
+        size_t total_large = FRAME_HDR + large_len + pad_large;
+        if (total_large >= 1300 && total_large <= 1390) {
+            large_clustered++;
+        } else if (total_large >= 500 && total_large <= 780) {
+            medium_noise++;
+        }
+    }
+
+    std::cout << "  [PASS] Small Packets clustered to QUIC ACK profile (~256B): " << small_clustered << " / " << TEST_SAMPLES << std::endl;
+    std::cout << "  [PASS] Large Packets clustered to Full MTU profile (~1350B): " << large_clustered << " / " << TEST_SAMPLES << std::endl;
+    std::cout << "  [PASS] Anti-Fingerprint Medium Noise Packets (512-768B): " << medium_noise << " generated" << std::endl;
+    assert(small_clustered > (TEST_SAMPLES * 85 / 100));
+    assert(large_clustered > (TEST_SAMPLES * 85 / 100));
+    assert(medium_noise > 0);
+
+    // -------------------------------------------------------------
+    // PILLAR 7: State-Machine Pre-Bypass (RFC 5389 STUN & RFC 9000 QUIC)
+    // -------------------------------------------------------------
+    std::cout << "\n[PILLAR 7] STATE-MACHINE PRE-BYPASS DECOY VERIFICATION..." << std::endl;
+    // 1. Verify STUN Binding Request
+    auto stun_pkt = IllusionPreBypass::generate_stun_binding();
+    assert(stun_pkt.size() == 20);
+    assert(stun_pkt[0] == 0x00 && stun_pkt[1] == 0x01); // RFC 5389 Binding Request
+    assert(stun_pkt[2] == 0x00 && stun_pkt[3] == 0x00); // 0 body length
+    // Magic Cookie: 0x2112A442
+    assert(stun_pkt[4] == 0x21 && stun_pkt[5] == 0x12 && stun_pkt[6] == 0xA4 && stun_pkt[7] == 0x42);
+    // Ensure transaction ID is randomized across runs
+    auto stun_pkt2 = IllusionPreBypass::generate_stun_binding();
+    assert(std::memcmp(&stun_pkt[8], &stun_pkt2[8], 12) != 0);
+    std::cout << "  [PASS] RFC 5389 STUN Binding Request Decoy: Format & Magic Cookie Verified" << std::endl;
+
+    // 2. Verify QUIC Initial Packet
+    auto quic_pkt = IllusionPreBypass::generate_quic_initial();
+    assert(quic_pkt.size() >= 1200); // RFC 9000 min MTU requirement
+    assert(quic_pkt[0] == 0xC3);    // Long Header + Initial
+    assert(quic_pkt[1] == 0x00 && quic_pkt[2] == 0x00 && quic_pkt[3] == 0x00 && quic_pkt[4] == 0x01); // QUIC v1
+    auto quic_pkt2 = IllusionPreBypass::generate_quic_initial();
+    assert(std::memcmp(&quic_pkt[6], &quic_pkt2[6], 8) != 0); // Randomized DCID
+    std::cout << "  [PASS] RFC 9000 QUIC Initial Decoy: MTU (1200B) & Long Header Verified" << std::endl;
+
+    // -------------------------------------------------------------
+    // PILLAR 8: Active Chaffing & Server-Side Silent Drop
+    // -------------------------------------------------------------
+    std::cout << "\n[PILLAR 8] ACTIVE CHAFFING & SILENT DROP VERIFICATION..." << std::endl;
+    ChaffEngine chaff(50, 10, 20); // 50ms idle threshold, 10-20ms chaff interval
+    assert(!chaff.should_send_chaff()); // Not idle yet
+
+    // Wait for idle timeout
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    assert(chaff.should_send_chaff());
+
+    // Reset with real packet activity
+    chaff.mark_real_packet();
+    assert(!chaff.should_send_chaff());
+
+    // Build and verify chaff wire packet
+    uint8_t test_raw_kid[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+    uint64_t chaff_tx_seq = 100;
+    auto chaff_wire = chaff.build_chaff_packet(test_raw_kid, mask_key, payload_key, chaff_tx_seq);
+    assert(!chaff_wire.empty());
+    assert(chaff_wire.size() >= 56);
+    assert(chaff_tx_seq == 101);
+
+    // Unmask header and check CHAFF flag (bit 0x80 at offset 10)
+    uint8_t unmasked_chaff_hdr[16];
+    assert(mask_unmask_header(chaff_wire.data() + 12, 16, mask_key, chaff_wire.data(), unmasked_chaff_hdr));
+    assert(std::memcmp(unmasked_chaff_hdr, test_raw_kid, 8) == 0);
+    assert((unmasked_chaff_hdr[10] & 0x80) != 0); // CHAFF bit set!
+    assert(std::memcmp(unmasked_chaff_hdr + 12, VER_MAGIC.data(), 4) == 0);
+
+    // Decrypt payload to ensure it is valid AEAD with 0 real bytes
+    const uint8_t* chaff_nonce = chaff_wire.data() + 12 + 16;
+    const uint8_t* chaff_ct = chaff_nonce + 12;
+    size_t chaff_ct_len = chaff_wire.size() - (12 + 16 + 12);
+    std::vector<uint8_t> chaff_pt(chaff_ct_len);
+    size_t chaff_pt_len = 0;
+    assert(chacha20_poly1305_decrypt(chaff_ct, chaff_ct_len, payload_key, chaff_nonce, chaff_pt.data(), chaff_pt_len));
+    uint16_t real_payload_len = (chaff_pt[0] << 8) | chaff_pt[1];
+    assert(real_payload_len == 0); // Zero bytes payload - server drops cleanly!
+    std::cout << "  [PASS] Chaff Idle Engine: Timing-driven generation verified" << std::endl;
+    std::cout << "  [PASS] Chaff Wire Packet: PlainHDR bit 0x80 verified & PayloadLen = 0 (Silent Drop)" << std::endl;
+
+    // -------------------------------------------------------------
+    // PILLAR 9: Cryptographic Blackhole Adaptive Probing Deception
+    // -------------------------------------------------------------
+    std::cout << "\n[PILLAR 9] CRYPTOGRAPHIC BLACKHOLE DECEPTION (Active Scanning Defense)..." << std::endl;
+    BlackholeResponder blackhole;
+
+    // 1. Rate limiter test
+    double test_time = 5000.0;
+    assert(blackhole.should_respond("192.0.2.1", test_time));
+    assert(!blackhole.should_respond("192.0.2.1", test_time + 0.05)); // Dropped due to rate limit (< 0.20s)
+    assert(blackhole.should_respond("192.0.2.1", test_time + 0.25));  // Allowed after 0.25s
+    assert(blackhole.should_respond("192.0.2.2", test_time + 0.05));  // Different IP is independent
+
+    // 2. Diversity test across 3 strategies
+    int vneg_count = 0, retry_count = 0, close_count = 0;
+    for (int i = 0; i < 500; ++i) {
+        uint8_t probe[64];
+        RAND_bytes(probe, 64);
+        auto resp = blackhole.generate_response(probe, 64);
+        assert(!resp.empty());
+        if (resp[0] == 0x80) {
+            vneg_count++;
+            // QUIC Version Negotiation checks
+            assert(resp.size() >= 15);
+            assert(resp[1] == 0x00 && resp[2] == 0x00 && resp[3] == 0x00 && resp[4] == 0x00); // Version 0
+        } else if ((resp[0] & 0xF0) == 0xF0) {
+            retry_count++;
+            // QUIC Retry checks
+            assert(resp.size() >= 32);
+        } else if ((resp[0] & 0xC0) == 0x40) {
+            close_count++;
+            // QUIC Connection Close checks
+            assert(resp.size() >= 25);
+        }
+    }
+
+    std::cout << "  [PASS] Blackhole Token-Bucket Rate Limiter: Per-IP Protection Verified" << std::endl;
+    std::cout << "  [PASS] Adaptive Strategy 1 (QUIC Version Negotiation, RFC 9000): " << vneg_count << " / 500" << std::endl;
+    std::cout << "  [PASS] Adaptive Strategy 2 (QUIC Retry Token Injection): " << retry_count << " / 500" << std::endl;
+    std::cout << "  [PASS] Adaptive Strategy 3 (QUIC Connection Close Frame): " << close_count << " / 500" << std::endl;
+    assert(vneg_count > 0 && retry_count > 0 && close_count > 0);
+
     std::cout << "\n=================================================================" << std::endl;
-    std::cout << "🎉 ALL 5 ADVANCED SECURITY, RELIABILITY & SPEED SUITES: 100% PASS!" << std::endl;
+    std::cout << "🎉 ALL 9 ADVANCED SECURITY, RELIABILITY & ANTI-DPI SUITES: 100% PASS!" << std::endl;
     std::cout << "=================================================================" << std::endl;
     return 0;
 }

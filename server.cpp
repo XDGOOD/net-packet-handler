@@ -27,6 +27,8 @@
 #include "handshake.h"
 #include "ip_pool.h"
 #include "nat_manager.h"
+#include "blackhole_responder.h"
+#include "traffic_shaper.h"
 
 // --- AEGS Protocol v2 Constants ---
 // AWG v1/v2/v3 Obfuscation & Noise Architecture + VLESS-REALITY Mimicry
@@ -222,28 +224,32 @@ bool set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
 }
 
-// Rate-limited VLESS-REALITY Probing Fallback Response (DNS FORMERR)
-void send_probing_fallback(int fd, const struct sockaddr_in& caddr, FailRecord& rec, double now) {
-    // Rate limit: max 5 responses/sec per scanning IP to prevent amplification/CPU starvation
-    if (now - rec.last_fallback_dns < 0.20) return;
-    rec.last_fallback_dns = now;
+// Global BlackholeResponder for anti active-probing
+BlackholeResponder g_blackhole;
 
-    static const uint8_t fake_dns_formerr[12] = {
-        0x00, 0x00, // Query ID
-        0x81, 0x81, // Flags: Response, Opcode 0, FormErr (RCODE 1)
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-    };
-    sendto(fd, fake_dns_formerr, sizeof(fake_dns_formerr), 0, (struct sockaddr*)&caddr, sizeof(caddr));
+// Blackhole-enhanced probing fallback: generates varied QUIC-like responses
+void send_probing_fallback(int fd, const struct sockaddr_in& caddr,
+                           const uint8_t* probe_data, size_t probe_len,
+                           const std::string& ip, double now) {
+    if (!g_blackhole.should_respond(ip, now))
+        return;
+    auto resp = g_blackhole.generate_response(probe_data, probe_len);
+    if (!resp.empty()) {
+        sendto(fd, resp.data(), resp.size(), 0,
+               (struct sockaddr*)&caddr, sizeof(caddr));
+    }
 }
 
-void record_fail(int fd, const struct sockaddr_in& caddr, const std::string& ip, double now, double weight) {
+void record_fail(int fd, const struct sockaddr_in& caddr,
+                  const uint8_t* probe_data, size_t probe_len,
+                  const std::string& ip, double now, double weight) {
     auto& rec = failed_attempts[ip];
     if (rec.level == 0) rec.level = 1;
     if (now - rec.last_seen > 120.0) { rec.weight = 0; }
     rec.last_seen = now;
     rec.weight += weight;
     
-    send_probing_fallback(fd, caddr, rec, now);
+    send_probing_fallback(fd, caddr, probe_data, probe_len, ip, now);
 
     if (rec.weight >= 10.0) {
         int lvl = std::min(rec.level, 3);
@@ -334,6 +340,9 @@ int main() {
     HandshakeServer hs_server(user_map, master_key_map);
     auto server_pubkey = hs_server.get_pubkey();
 
+    TrafficShaper shaper(5, false);
+    shaper.set_semantic_enabled(true);
+
     int server_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (server_fd < 0) { perror("socket"); return 1; }
     if (!set_nonblocking(server_fd)) { perror("fcntl"); return 1; }
@@ -412,7 +421,7 @@ int main() {
                 }
 
                 // AEGS v2 Min Outer Size: HDR_IV(12) + MASKED_HDR(16) + AEAD_IV(12) + TAG(16) = 56 bytes
-                if (len < 56) { record_fail(server_fd, caddr, ip, now, 1.0); continue; }
+                if (len < 56) { record_fail(server_fd, caddr, buffer.data(), (size_t)len, ip, now, 1.0); continue; }
 
                 const uint8_t* hdr_iv = buffer.data();
                 Session* matched_sess = nullptr;
@@ -432,15 +441,13 @@ int main() {
                     }
                 }
 
-                if (!matched_sess) { record_fail(server_fd, caddr, ip, now, 1.0); continue; }
+                if (!matched_sess) { record_fail(server_fd, caddr, buffer.data(), (size_t)len, ip, now, 1.0); continue; }
 
                 Session* s = matched_sess;
-                s->client_addr = caddr; s->has_client = true;
-                s->last_activity = now;
 
                 uint16_t junk_len = (unmasked_hdr[8] << 8) | unmasked_hdr[9];
                 size_t aead_offset = 12 + 16 + junk_len;
-                if ((size_t)len < aead_offset + 12 + TAG_LEN) { record_fail(server_fd, caddr, ip, now, 0.5); continue; }
+                if ((size_t)len < aead_offset + 12 + TAG_LEN) { record_fail(server_fd, caddr, buffer.data(), (size_t)len, ip, now, 0.5); continue; }
 
                 const uint8_t* aead_nonce = buffer.data() + aead_offset;
                 if (s->check_replay(aead_nonce)) continue;
@@ -451,10 +458,19 @@ int main() {
                 size_t dec_len = 0;
                 const uint8_t* dec_key = s->v3_handshake_done ? s->session_keys.send_key : s->payload_key;
                 if (!chacha20_poly1305_decrypt(ct, ct_len, dec_key, aead_nonce, dec_buf.data(), dec_len)) {
-                    record_fail(server_fd, caddr, ip, now, 0.5); continue;
+                    record_fail(server_fd, caddr, buffer.data(), (size_t)len, ip, now, 0.5); continue;
                 }
 
+                // Authentication passed! Securely update roaming endpoint.
+                s->client_addr = caddr; 
+                s->has_client = true;
+                s->last_activity = now;
                 failed_attempts.erase(ip);
+
+                if (unmasked_hdr[10] & 0x80) {
+                    std::cout << "[DEBUG] Received CHAFF packet from " << ip << "\n";
+                    continue;
+                }
 
                 if (dec_len < 2) continue;
                 uint16_t plen = (dec_buf[0] << 8) | dec_buf[1];
@@ -477,7 +493,7 @@ int main() {
 
                 const uint8_t* enc_key = s->v3_handshake_done ? s->session_keys.recv_key : s->payload_key;
 
-                size_t pad_len = secure_pad_len();
+                size_t pad_len = shaper.semantic_pad((size_t)n);
                 size_t frame_len = FRAME_HDR + (size_t)n + pad_len;
                 if (frame_len + TAG_LEN > dec_buf.size()) { pad_len = 0; frame_len = FRAME_HDR + (size_t)n; }
 

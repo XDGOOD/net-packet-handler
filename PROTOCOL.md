@@ -109,22 +109,78 @@ Offset  Len   Field
 - Assignment: during HANDSHAKE_RESP, in EncryptedConfig field
 - Release: on session idle timeout (180 seconds)
 
-## 8. DPI Evasion Properties
+## 8. DPI Evasion Properties (AEGS v4 Pantheon)
+
+### 8.1 State-Machine Pre-Bypass ("AEGS Illusion")
+Before sending `HANDSHAKE_INIT`, the client transmits 1-3 decoy packets that perfectly
+mimic standard STUN Binding Requests (RFC 5389) or QUIC Initial packets (RFC 9000).
+
+**Effect:** DPI state machines classify the flow as `App: STUN / WebRTC` or `App: HTTP/3`
+and stop deep inspection. The real cryptographic handshake proceeds under this cover identity.
+
+Module: `illusion_prebypass.h/cpp`
+
+### 8.2 Semantic Padding ("Bimodal Shaping" — Anti-ML)
+Replaces uniform random padding (32-256 bytes) with intelligent bimodal shaping:
+- Small packets (≤200 B) → padded to ~256 B (QUIC ACK profile, ±16 B jitter)
+- Large packets (>200 B) → padded to ~1350 B (full MTU QUIC frame, ±32 B jitter)
+- 5% probability of medium packets (512-768 B) to prevent fingerprinting the bimodal itself
+
+**Effect:** ML classifiers see a packet-size distribution indistinguishable from
+YouTube / QUIC browsing traffic. Configured via `AEGS_SEMANTIC_PADDING=1`.
+
+Module: `traffic_shaper.h/cpp` (`semantic_pad()` method)
+
+### 8.3 Active Chaffing (Anti-Timing Analysis)
+During idle periods (>500 ms since last real packet), the client generates chaff packets
+at random 50-200 ms intervals. Chaff packets use the standard AEGS wire format with
+bit `0x80` set in PlainHDR byte 10 (Reserved field). The server authenticates and then
+silently drops them without forwarding to TUN.
+
+**Effect:** To an observer, the tunnel looks like a continuous WebRTC voice call with
+constant packet flow, masking real user activity timing patterns.
+
+Module: `chaff_engine.h/cpp`
+
+### 8.4 Cryptographic Blackhole (Anti Active Probing)
+When receiving invalid probe packets, the server responds with realistic QUIC packets
+derived from the probe's own entropy:
+- QUIC Version Negotiation (60%) — echoes probe CIDs, offers versions 1 + draft-32
+- QUIC Retry (20%) — asks prober to retry with a token
+- QUIC Connection Close (20%) — reports PROTOCOL_VIOLATION
+
+**Effect:** Active scanners conclude this is an ordinary QUIC server and de-list the IP.
+Rate-limited to 5 responses/sec per source IP.
+
+Module: `blackhole_responder.h/cpp`
+
+### 8.5 Summary Table
 | Property | How achieved |
 |---|---|
+| Defeats DPI state machines | Illusion pre-bypass (fake STUN/QUIC before handshake) |
+| Defeats ML classifiers | Bimodal semantic padding (YouTube-like distribution) |
+| Defeats timing analysis | Active chaffing (constant packet flow during idle) |
+| Defeats active probing | Cryptographic blackhole (varied QUIC responses) |
 | No static byte signature | VER_MAGIC always masked; first 12 bytes are random IV |
 | Looks like random UDP | All observable bytes are pseudorandom |
-| DNS fallback | Invalid packets get DNS FORMERR response |
-| Variable length | Random junk padding per packet |
-| No timing pattern | epoll-based, no sleep() in hot path |
+| Variable length | Semantic padding + random junk per packet |
+| No timing pattern | Chaff engine + epoll-based, no sleep() in hot path |
 
 ## 9. Security Considerations
 - Token brute-force: 200,000 PBKDF2 iterations (~1s on modern CPU)
-- DoS: rate limiter (5 DNS responses/sec per IP), IP banning after 10 weight points
+- DoS: rate limiter (5 responses/sec per IP), IP banning after 10 weight points
 - Replay: RFC 6479 64-bit window
 - Forward secrecy: ephemeral X25519 per session
 - Memory safety: ASan/UBSan verified, zero heap allocs in hot path
+- Chaff MAC verification: chaff packets are fully authenticated before dropping
 
 ## 10. Comparison with Related Protocols
-WireGuard Noise provides strong cryptographic guarantees but has static handshake patterns that can be easily identified by DPI.
-AmneziaWG obfuscation adds random padding and header masking to WireGuard, but AEGS v3 goes further by making all bytes pseudorandom and incorporating a DNS fallback mechanism for invalid packets, as well as zero heap allocs in the hot path.
+| Feature | WireGuard | AmneziaWG 3.1 | XTLS-Reality | AEGS v4 Pantheon |
+|---|---|---|---|---|
+| Static handshake signature | Yes | Masked | N/A (TCP) | Masked + Illusion decoys |
+| Padding | None | Uniform random (Jc) | None | Bimodal semantic (anti-ML) |
+| Timing obfuscation | None | None | None | Active chaffing |
+| Active probe resistance | None | DNS FORMERR | TLS camouflage | QUIC blackhole (3 strategies) |
+| Forward secrecy | Yes | Yes | Yes | Yes (X25519 per session) |
+| Protocol | UDP | UDP | TCP | UDP |
+
