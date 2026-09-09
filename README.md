@@ -1,6 +1,6 @@
 # AEGS v4 "Pantheon" — Autonomous Encrypted Gateway System
 
-[![Tests](https://img.shields.io/badge/Tests-11%2F11%20Pillars%20PASS-brightgreen.svg)](#)
+[![Tests](https://img.shields.io/badge/Tests-12%2F12%20Pillars%20PASS-brightgreen.svg)](#)
 [![Language](https://img.shields.io/badge/Language-C%2B%2B17-blue.svg)](#)
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)](#)
 [![Version](https://img.shields.io/badge/Version-4.0%20Pantheon-orange.svg)](#)
@@ -41,15 +41,17 @@ AEGS v4 is an advanced transport protocol specifically engineered to defeat both
   * **20%**: QUIC Connection Close (`PROTOCOL_VIOLATION`)
 * **Effect:** Scanners conclude the port hosts an ordinary QUIC server and de-list the IP.
 
----
-
-### 5. Port Hopping (Active DPI Evasion)
+### 5. 🔀 Port Hopping (Active DPI Evasion)
 * **Problem:** DPI blocks specific UDP ports when VPN traffic is suspected.
 * **Solution:** Server binds to multiple ports. Client uses HMAC-SHA256 to deterministically hop ports every `hop_interval` seconds based on the session key.
 
-### 6. Session Resumption (Zero-RTT Reconnect)
+### 6. ⚡ Session Resumption (Zero-RTT Reconnect)
 * **Problem:** ECDH handshakes are expensive and slow down reconnections.
 * **Solution:** Server issues an encrypted, AEAD-authenticated 96-byte `ResumptionToken`. Client sends a `RESUME` packet to reconnect in <5ms.
+
+### 7. 🔒 Hardware Kill-Switch & DNS Leak Shield
+* **Problem:** If a tunnel unexpectedly disconnects, packets leak to the ISP via physical adapters. Plaintext DNS queries (port 53) leak visited domains.
+* **Solution:** Hardware/firewall-level isolation (`--kill-switch`) drops all external traffic except direct packets to the VPN server, while `--dns-protect` enforces tunnel DNS and blocks port 53 leakage.
 
 ---
 
@@ -64,13 +66,14 @@ AEGS v4 is an advanced transport protocol specifically engineered to defeat both
 | Active Prober Defense | ❌ None | ⚠️ DNS FORMERR | ✅ TLS Camouflage | ✅ **Cryptographic Blackhole (3 QUIC strategies)** |
 | Transport Protocol | UDP | UDP | TCP only | ✅ **UDP + Port Hopping + Mimicry** |
 | Forward Secrecy (PFS) | ✅ Noise IK | ✅ Noise IK | ✅ TLS 1.3 | ✅ **X25519 ECDH per-session** |
+| Hardware Kill-Switch | ⚠️ Client app | ⚠️ Client app | ⚠️ Client app | ✅ **Firewall Isolation + Port 53 Shield** |
 | Zero-Allocation Hot Path | ✅ | ⚠️ | ⚠️ | ✅ **Thread-local scratch buffers** |
 
 ---
 
-## 🧪 11-Pillar Test Suite
+## 🧪 12-Pillar Test Suite
 
-The project includes a comprehensive 11-Pillar verification suite:
+The project includes a comprehensive 12-Pillar verification suite:
 * **Pillar 1:** Cryptographic Context Separation (HKDF-SHA256, 200k PBKDF2 iterations)
 * **Pillar 2:** Shannon Entropy (>7.2 / 8.0 on wire, indistinguishable from white noise)
 * **Pillar 3:** RFC 6479 64-bit Anti-Replay Sliding Window & 100% Poly1305 tamper detection
@@ -80,6 +83,9 @@ The project includes a comprehensive 11-Pillar verification suite:
 * **Pillar 7:** State-Machine Pre-Bypass (RFC 5389 STUN & RFC 9000 QUIC Initial format)
 * **Pillar 8:** Active Chaffing, Idle Detection & Server Silent Drop
 * **Pillar 9:** Cryptographic Blackhole Adaptive Probing Deception (Token-bucket rate limiter + 3 strategies)
+* **Pillar 10:** Deterministic HMAC-SHA256 Port Hopping with Uniform Port Distribution
+* **Pillar 11:** ChaCha20-Poly1305 Encrypted 96-Byte Session Resumption Tokens (<5ms 0-RTT)
+* **Pillar 12:** Hardware Kill-Switch Isolation, Port 53 DNS Shield & Transport Blackout Detection
 
 Run the suite:
 ```bash

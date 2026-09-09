@@ -226,3 +226,30 @@ After successful ECDH handshake, server issues a **ResumptionToken** (96 bytes):
 | Forward secrecy | Yes | Yes | Yes | Yes (X25519 per session) |
 | Protocol | UDP | UDP | TCP | UDP |
 
+## 13. Network Security & Reliability Suite
+
+AEGS v4 integrates dedicated hardware/firewall level leak prevention:
+
+### 13.1 Hardware Kill-Switch Isolation
+When enabled (`--kill-switch` or `AEGS_KILL_SWITCH=1`), strict firewall filtering rules are engaged:
+- **Dedicated Chain (`AEGS_KILLSWITCH`):**
+  1. Permits established and related traffic (`ESTABLISHED,RELATED`).
+  2. Permits loopback traffic (`lo` / `127.0.0.1`).
+  3. Permits all traffic routed through the VPN tunnel (`aegs0`).
+  4. Permits local DHCP client renewal (UDP 67/68).
+  5. Permits direct traffic to the VPN server IP strictly on the active port hopping range (`base_port:base_port+port_count-1`).
+  6. **DROPS** all other outgoing traffic across physical interfaces.
+- **RAII Lifecycle:** All rules are automatically restored on clean client exit, and signal traps handle unexpected interruptions.
+
+### 13.2 DNS Leak Protection Shield
+When enabled (`--dns-protect` or `AEGS_DNS_PROTECT=1`):
+- **Port 53 Lockdown:** Blocks all unencrypted UDP and TCP port 53 packets directed at external physical network adapters.
+- **Resolver Enforcement:** Directs all domain resolution exclusively through the internal tunnel DNS (`10.8.0.1` or configured DNS) via `/etc/resolv.conf` backup and atomic restoration.
+
+### 13.3 Transport Failure Detection & Multi-Transport Fallback
+`TransportFailureDetector` continuously monitors transport health:
+- Tracks consecutive timeout counts and sustained blackout duration.
+- Identifies severe packet suppression (>75% sustained drop across 100+ packets).
+- Triggers automatic TCP/TLS 1.3 fallback recommendations when UDP is censored or throttled.
+
+

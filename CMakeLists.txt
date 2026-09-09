@@ -28,6 +28,7 @@ set(DPI_SOURCES
     chaff_engine.cpp
     illusion_prebypass.cpp
     blackhole_responder.cpp
+    network_security.cpp
 )
 
 add_executable(aegis_server server.cpp tun_interface.cpp ip_router.cpp handshake.cpp ip_pool.cpp nat_manager.cpp ${DPI_SOURCES})

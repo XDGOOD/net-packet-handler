@@ -20,6 +20,7 @@ import select
 import struct
 import secrets
 import hashlib
+import hmac
 import argparse
 import subprocess
 from pathlib import Path
@@ -215,11 +216,70 @@ def shutil_which(cmd: str) -> str | None:
     import shutil
     return shutil.which(cmd)
 
+def compute_hopper_port(key: bytes, base_port: int, count: int, interval: int) -> int:
+    epoch = int(time.time()) // (interval if interval > 0 else 30)
+    epoch_bytes = struct.pack('>Q', epoch)
+    h = hmac.new(key, epoch_bytes, hashlib.sha256).digest()
+    val = struct.unpack('<I', h[:4])[0]
+    return base_port + (val % (count if count > 0 else 1))
+
+def enable_killswitch(server_ip: str, base_port: int, port_count: int):
+    print(f"{Colors.YELLOW}[KillSwitch] Engaging traffic isolation rules...{Colors.RESET}")
+    if os.name == 'nt':
+        try:
+            subprocess.run(["netsh", "advfirewall", "firewall", "add", "rule", "name=AEGS-KS-Allow-Loopback", "dir=out", "action=allow", "remoteip=127.0.0.1", "enable=yes"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["netsh", "advfirewall", "firewall", "add", "rule", "name=AEGS-KS-Allow-DHCP", "dir=out", "action=allow", "protocol=UDP", "localport=68", "remoteport=67", "enable=yes"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["netsh", "advfirewall", "firewall", "add", "rule", "name=AEGS-KS-Allow-Server", "dir=out", "action=allow", f"remoteip={server_ip}", "protocol=UDP", f"remoteport={base_port}-{base_port+port_count-1}", "enable=yes"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["netsh", "advfirewall", "firewall", "add", "rule", "name=AEGS-KS-Block-All", "dir=out", "action=block", "enable=yes"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"{Colors.GREEN}[KillSwitch] Windows Firewall rules active (Direct leaks blocked).{Colors.RESET}")
+        except Exception as e:
+            print(f"{Colors.RED}[KillSwitch] Firewall rule setup failed (admin required): {e}{Colors.RESET}")
+    else:
+        try:
+            subprocess.run(["iptables", "-N", "AEGS_KILLSWITCH"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["iptables", "-A", "AEGS_KILLSWITCH", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["iptables", "-A", "AEGS_KILLSWITCH", "-o", "lo", "-j", "ACCEPT"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["iptables", "-A", "AEGS_KILLSWITCH", "-p", "udp", "--sport", "68", "--dport", "67", "-j", "ACCEPT"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            port_spec = f"{base_port}:{base_port+port_count-1}" if port_count > 1 else str(base_port)
+            subprocess.run(["iptables", "-A", "AEGS_KILLSWITCH", "-d", server_ip, "-p", "udp", "--dport", port_spec, "-j", "ACCEPT"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["iptables", "-A", "AEGS_KILLSWITCH", "-j", "DROP"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["iptables", "-I", "OUTPUT", "1", "-j", "AEGS_KILLSWITCH"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"{Colors.GREEN}[KillSwitch] Linux iptables rules active.{Colors.RESET}")
+        except Exception as e:
+            print(f"{Colors.RED}[KillSwitch] Iptables setup failed (root required): {e}{Colors.RESET}")
+
+def disable_killswitch():
+    print(f"{Colors.YELLOW}[KillSwitch] Clearing traffic isolation rules...{Colors.RESET}")
+    if os.name == 'nt':
+        for r in ["AEGS-KS-Allow-Loopback", "AEGS-KS-Allow-DHCP", "AEGS-KS-Allow-Server", "AEGS-KS-Block-All", "AEGS-KS-Block-DNS"]:
+            subprocess.run(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={r}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.run(["iptables", "-D", "OUTPUT", "-j", "AEGS_KILLSWITCH"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["iptables", "-F", "AEGS_KILLSWITCH"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["iptables", "-X", "AEGS_KILLSWITCH"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["iptables", "-D", "OUTPUT", "-j", "AEGS_DNS_SHIELD"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["iptables", "-F", "AEGS_DNS_SHIELD"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["iptables", "-X", "AEGS_DNS_SHIELD"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"{Colors.GREEN}[KillSwitch] Cleaned up.{Colors.RESET}")
+
+def enable_dns_shield():
+    print(f"{Colors.YELLOW}[DNS-Shield] Enforcing DNS leak shield (Blocking port 53 on physical adapters)...{Colors.RESET}")
+    if os.name == 'nt':
+        subprocess.run(["netsh", "advfirewall", "firewall", "add", "rule", "name=AEGS-KS-Block-DNS", "dir=out", "action=block", "protocol=UDP", "remoteport=53", "remoteip=!127.0.0.1", "enable=yes"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.run(["iptables", "-N", "AEGS_DNS_SHIELD"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["iptables", "-A", "AEGS_DNS_SHIELD", "-o", "lo", "-p", "udp", "--dport", "53", "-j", "ACCEPT"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["iptables", "-A", "AEGS_DNS_SHIELD", "-p", "udp", "--dport", "53", "-j", "DROP"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["iptables", "-I", "OUTPUT", "1", "-j", "AEGS_DNS_SHIELD"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"{Colors.GREEN}[DNS-Shield] Plaintext DNS blocked.{Colors.RESET}")
+
 # --- Pure-Python Proxy Engine ---
-def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOCAL_PORT):
+def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOCAL_PORT,
+                     kill_switch: bool = False, dns_protect: bool = False,
+                     port_count: int = 10, hop_interval: int = 30):
     """
-    Pure Python zero-dependency (cryptography required) AEGS v2 proxy client.
-    Listens on 127.0.0.1:local_port, forwards encrypted UDP datagrams to server_host:50001.
+    Pure Python zero-dependency (cryptography required) AEGS v4 proxy client.
+    Listens on 127.0.0.1:local_port, forwards encrypted UDP datagrams to server_host.
     """
     try:
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -241,6 +301,11 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
 
     server_addr = (server_ip, DEFAULT_SERVER_PORT)
 
+    if kill_switch:
+        enable_killswitch(server_ip, DEFAULT_SERVER_PORT, port_count)
+    if dns_protect:
+        enable_dns_shield()
+
     # Bind local UDP listener for WireGuard
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -255,7 +320,7 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
     print(f"     - Remote Server: {server_host} ({server_ip}:{DEFAULT_SERVER_PORT})")
     print(f"     - Key ID:        {kid_hex}")
     print(f"     - WireGuard:     Set Endpoint = 127.0.0.1:{local_port}")
-    print(f"     - Anti-DPI:      Illusion Pre-Bypass + Bimodal Shaping + Active Chaffing active\n")
+    print(f"     - Anti-DPI:      Illusion Pre-Bypass + Bimodal Shaping + Active Chaffing + Port Hopping\n")
 
     # State-Machine Pre-Bypass: send STUN / QUIC Initial decoys before flow
     print(f"{Colors.CYAN}[*] Sending State-Machine Pre-Bypass decoys (STUN / QUIC)...{Colors.RESET}")
@@ -309,7 +374,8 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
                     chaff_iv = secrets.token_bytes(12)
                     chaff_masked = mask_unmask_header(bytes(chaff_hdr), mask_key, chaff_iv)
                     try:
-                        sock.sendto(chaff_iv + chaff_masked + chaff_nonce + chaff_ct, server_addr)
+                        cur_port = compute_hopper_port(payload_key, DEFAULT_SERVER_PORT, port_count, hop_interval)
+                        sock.sendto(chaff_iv + chaff_masked + chaff_nonce + chaff_ct, (server_ip, cur_port))
                     except OSError:
                         pass
 
@@ -321,7 +387,8 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
             if not data:
                 continue
 
-            if addr == server_addr:
+            is_server = (addr[0] == server_ip and DEFAULT_SERVER_PORT <= addr[1] < DEFAULT_SERVER_PORT + port_count)
+            if is_server:
                 # Inbound packet from remote AEGS server -> decrypt -> send to local WireGuard
                 if len(data) < 56:
                     continue
@@ -387,11 +454,14 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
                 out_pkt.extend(aead_nonce)
                 out_pkt.extend(ct)
 
-                sock.sendto(bytes(out_pkt), server_addr)
+                cur_port = compute_hopper_port(payload_key, DEFAULT_SERVER_PORT, port_count, hop_interval)
+                sock.sendto(bytes(out_pkt), (server_ip, cur_port))
 
     except KeyboardInterrupt:
         print(f"\n{Colors.YELLOW}[*] Stopping AEGS client proxy...{Colors.RESET}")
     finally:
+        if kill_switch or dns_protect:
+            disable_killswitch()
         sock.close()
 
 # --- Config & CLI Handlers ---
@@ -428,9 +498,14 @@ def run_command(args):
         sys.exit(1)
 
     native_bin = find_native_binary()
+    kill_switch = getattr(args, 'kill_switch', False)
+    dns_protect = getattr(args, 'dns_protect', False)
+
     if native_bin and not args.force_python:
         print(f"{Colors.GREEN}[OK] Using native compiled binary: {native_bin}{Colors.RESET}")
         cmd = [str(native_bin), "--server", server, "--token", token, "--port", str(port)]
+        if kill_switch: cmd.append("--kill-switch")
+        if dns_protect: cmd.append("--dns-protect")
         try:
             subprocess.run(cmd)
         except KeyboardInterrupt:
@@ -440,7 +515,7 @@ def run_command(args):
             print(f"{Colors.CYAN}[*] Running with pure-Python proxy engine (--force-python requested)...{Colors.RESET}")
         else:
             print(f"{Colors.YELLOW}[*] Native binary not found. Falling back to built-in pure-Python engine...{Colors.RESET}")
-        run_python_proxy(server, token, port)
+        run_python_proxy(server, token, port, kill_switch=kill_switch, dns_protect=dns_protect)
 
 def keyid_command(args):
     _, kid_hex = compute_key_id(args.token)
@@ -481,6 +556,8 @@ def main():
     run_parser.add_argument("-s", "--server", help="AEGS server IP or domain")
     run_parser.add_argument("-t", "--token", help="User authentication secret token")
     run_parser.add_argument("-p", "--port", type=int, default=DEFAULT_LOCAL_PORT, help="Local UDP port (default: 51821)")
+    run_parser.add_argument("--kill-switch", action="store_true", help="Enable hardware/firewall Kill-Switch")
+    run_parser.add_argument("--dns-protect", action="store_true", help="Enable DNS Leak Protection shield")
     run_parser.add_argument("--force-python", action="store_true", help="Force pure-Python proxy instead of native binary")
 
     # KeyID command

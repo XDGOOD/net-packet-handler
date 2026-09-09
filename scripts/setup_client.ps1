@@ -34,6 +34,12 @@ param (
     [Parameter(ParameterSetName = "Run")]
     [switch]$GenerateWireGuardConfig,
 
+    [Parameter(ParameterSetName = "Run")]
+    [switch]$KillSwitch,
+
+    [Parameter(ParameterSetName = "Run")]
+    [switch]$DnsLeakProtection,
+
     [Parameter(ParameterSetName = "Stop")]
     [switch]$Stop,
 
@@ -183,9 +189,43 @@ function Get-ClientStatus {
     }
 }
 
+function Enable-KillSwitch([string]$srv, [int]$p) {
+    Write-Host "[KillSwitch] Engaging Windows Firewall traffic isolation..." -ForegroundColor Yellow
+    try {
+        netsh advfirewall firewall add rule name="AEGS-KS-Allow-Loopback" dir=out action=allow remoteip=127.0.0.1 enable=yes | Out-Null
+        netsh advfirewall firewall add rule name="AEGS-KS-Allow-DHCP" dir=out action=allow protocol=UDP localport=68 remoteport=67 enable=yes | Out-Null
+        netsh advfirewall firewall add rule name="AEGS-KS-Allow-Server" dir=out action=allow remoteip=$srv protocol=UDP remoteport="$p-$($p+15)" enable=yes | Out-Null
+        netsh advfirewall firewall add rule name="AEGS-KS-Block-All" dir=out action=block enable=yes | Out-Null
+        Write-Host "[KillSwitch] Traffic leak prevention ACTIVE (Direct leaks dropped)." -ForegroundColor Green
+    } catch {
+        Write-Host "[KillSwitch] Warning: Administrator privileges required for Windows Firewall rules." -ForegroundColor Red
+    }
+}
+
+function Disable-KillSwitch {
+    Write-Host "[KillSwitch] Removing Windows Firewall leak prevention rules..." -ForegroundColor Yellow
+    netsh advfirewall firewall delete rule name="AEGS-KS-Allow-Loopback" 2>$null | Out-Null
+    netsh advfirewall firewall delete rule name="AEGS-KS-Allow-DHCP" 2>$null | Out-Null
+    netsh advfirewall firewall delete rule name="AEGS-KS-Allow-Server" 2>$null | Out-Null
+    netsh advfirewall firewall delete rule name="AEGS-KS-Block-All" 2>$null | Out-Null
+    netsh advfirewall firewall delete rule name="AEGS-KS-Block-DNS" 2>$null | Out-Null
+    Write-Host "[KillSwitch] Rules cleared." -ForegroundColor Green
+}
+
+function Enable-DnsLeakProtection {
+    Write-Host "[DNS-Shield] Enforcing DNS leak shield (Blocking UDP/TCP 53 on physical adapters)..." -ForegroundColor Yellow
+    try {
+        netsh advfirewall firewall add rule name="AEGS-KS-Block-DNS" dir=out action=block protocol=UDP remoteport=53 remoteip="!127.0.0.1" enable=yes | Out-Null
+        Write-Host "[DNS-Shield] Plaintext DNS leak protection ACTIVE." -ForegroundColor Green
+    } catch {
+        Write-Host "[DNS-Shield] Warning: Administrator privileges required for DNS shield." -ForegroundColor Red
+    }
+}
+
 # --- Action Router ---
 if ($Stop) {
     Stop-ClientProcess
+    Disable-KillSwitch
     exit 0
 }
 
@@ -252,15 +292,32 @@ Write-Host ""
 
 $bin = Find-ClientBinary
 
+if ($KillSwitch) {
+    Enable-KillSwitch -srv $Server -p 50001
+}
+if ($DnsLeakProtection) {
+    Enable-DnsLeakProtection
+}
+
+$extraArgs = ""
+if ($KillSwitch) { $extraArgs += " --kill-switch" }
+if ($DnsLeakProtection) { $extraArgs += " --dns-protect" }
+
 if ($bin -eq "PYTHON_WRAPPER" -or ($null -eq $bin -and (Get-Command python -ErrorAction SilentlyContinue))) {
     $pyScript = Join-Path $ScriptDir "quick_client.py"
     Write-Host "Launching via Python proxy engine ($pyScript)..." -ForegroundColor Cyan
     
     if ($Background) {
-        Start-Process python -ArgumentList "`"$pyScript`" run --server `"$Server`" --token `"$Token`" --port $Port" -WindowStyle Hidden
+        Start-Process python -ArgumentList "`"$pyScript`" run --server `"$Server`" --token `"$Token`" --port $Port$extraArgs" -WindowStyle Hidden
         Write-Host "[OK] Client launched in background." -ForegroundColor Green
     } else {
-        python "$pyScript" run --server "$Server" --token "$Token" --port $Port
+        try {
+            python "$pyScript" run --server "$Server" --token "$Token" --port $Port $extraArgs
+        } finally {
+            if ($KillSwitch -or $DnsLeakProtection) {
+                Disable-KillSwitch
+            }
+        }
     }
     exit 0
 }
@@ -268,10 +325,16 @@ if ($bin -eq "PYTHON_WRAPPER" -or ($null -eq $bin -and (Get-Command python -Erro
 if ($null -ne $bin -and (Test-Path $bin)) {
     Write-Host "Using native binary: $bin" -ForegroundColor Green
     if ($Background) {
-        Start-Process -FilePath $bin -ArgumentList "--server `"$Server`" --token `"$Token`" --port $Port" -WindowStyle Hidden
+        Start-Process -FilePath $bin -ArgumentList "--server `"$Server`" --token `"$Token`" --port $Port$extraArgs" -WindowStyle Hidden
         Write-Host "[OK] Native AEGS client running in background." -ForegroundColor Green
     } else {
-        & $bin --server "$Server" --token "$Token" --port $Port
+        try {
+            & $bin --server "$Server" --token "$Token" --port $Port $extraArgs
+        } finally {
+            if ($KillSwitch -or $DnsLeakProtection) {
+                Disable-KillSwitch
+            }
+        }
     }
     exit 0
 }

@@ -201,6 +201,8 @@ ${C_BOLD}OPTIONS:${C_RESET}
   ${C_CYAN}-s, --server <HOST/IP>${C_RESET}   Remote AEGS v2 server IP or domain
   ${C_CYAN}-t, --token <TOKEN>${C_RESET}      User secret authentication token
   ${C_CYAN}-p, --port <PORT>${C_RESET}        Local UDP port for WireGuard connection (default: 51821)
+  ${C_CYAN}--kill-switch${C_RESET}            Block all traffic on external interfaces if tunnel drops
+  ${C_CYAN}--dns-protect${C_RESET}            Block plaintext DNS (port 53) on external interfaces
   ${C_CYAN}-d, --daemon${C_RESET}             Run in background as a daemon
   ${C_CYAN}--stop${C_RESET}                   Stop running client background instance
   ${C_CYAN}--status${C_RESET}                 Check client running status
@@ -228,6 +230,8 @@ main() {
     local port="$DEFAULT_LOCAL_PORT"
     local daemon_mode=false
     local gen_wg_only=false
+    local kill_switch=false
+    local dns_protect=false
 
     load_config
 
@@ -236,6 +240,8 @@ main() {
             -s|--server) server="$2"; shift 2 ;;
             -t|--token)  token="$2"; shift 2 ;;
             -p|--port)   port="$2"; shift 2 ;;
+            --kill-switch) kill_switch=true; shift ;;
+            --dns-protect) dns_protect=true; shift ;;
             -d|--daemon|--background) daemon_mode=true; shift ;;
             --stop)      cmd_stop; exit 0 ;;
             --status)    cmd_status; exit 0 ;;
@@ -301,10 +307,14 @@ main() {
     echo -e "${C_YELLOW}Point your WireGuard client's [Peer] Endpoint to:${C_RESET} ${C_BOLD}127.0.0.1:${port}${C_RESET}"
     echo -e "${C_CYAN}========================================================================${C_RESET}\n"
 
+    local extra_args=()
+    if $kill_switch; then extra_args+=("--kill-switch"); fi
+    if $dns_protect; then extra_args+=("--dns-protect"); fi
+
     if $daemon_mode; then
         mkdir -p "${CONFIG_DIR}"
         cmd_stop 2>/dev/null || true
-        nohup "$client_bin" --server "$server" --token "$token" --port "$port" > "${LOG_FILE}" 2>&1 &
+        nohup "$client_bin" --server "$server" --token "$token" --port "$port" "${extra_args[@]}" > "${LOG_FILE}" 2>&1 &
         local pid=$!
         echo "$pid" > "${PID_FILE}"
         log_success "AEGS client is running in background (PID: $pid)"
@@ -312,7 +322,7 @@ main() {
         log_info "Stop with: ./setup_client.sh --stop"
     else
         log_info "Starting client proxy in foreground (Press Ctrl+C to stop)..."
-        exec "$client_bin" --server "$server" --token "$token" --port "$port"
+        exec "$client_bin" --server "$server" --token "$token" --port "$port" "${extra_args[@]}"
     fi
 }
 

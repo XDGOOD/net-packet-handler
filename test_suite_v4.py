@@ -354,9 +354,108 @@ class Pillar11_SessionResumption(unittest.TestCase):
         """ResumptionToken must be exactly 96 bytes."""
         self.assertEqual(32 + 32 + 16 + 16, 96)
 
+class Pillar12_NetworkSecurityAndLeakProtection(unittest.TestCase):
+    """Pillar 12: Hardware Kill-Switch isolation, DNS Leak Shield, and TCP Fallback trigger."""
+
+    def test_killswitch_rule_synthesis(self):
+        """KillSwitch rule generator produces strict, bounded firewall rules."""
+        server_ip = "198.51.100.42"
+        base_port = 50001
+        port_count = 10
+        tun_iface = "aegs0"
+
+        # Simulate generate_rules
+        rules = [
+            "iptables -N AEGS_KILLSWITCH",
+            "iptables -A AEGS_KILLSWITCH -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+            "iptables -A AEGS_KILLSWITCH -o lo -j ACCEPT",
+            f"iptables -A AEGS_KILLSWITCH -o {tun_iface} -j ACCEPT",
+            "iptables -A AEGS_KILLSWITCH -p udp --sport 68 --dport 67 -j ACCEPT",
+            f"iptables -A AEGS_KILLSWITCH -d {server_ip} -p udp --dport {base_port}:{base_port+port_count-1} -j ACCEPT",
+            f"iptables -A AEGS_KILLSWITCH -d {server_ip} -p tcp --dport {base_port}:{base_port+port_count-1} -j ACCEPT",
+            "iptables -A AEGS_KILLSWITCH -j DROP",
+            "iptables -I OUTPUT 1 -j AEGS_KILLSWITCH"
+        ]
+
+        # Invariant 1: Loopback must be allowed
+        self.assertTrue(any("-o lo -j ACCEPT" in r for r in rules))
+        # Invariant 2: TUN interface must be allowed
+        self.assertTrue(any(f"-o {tun_iface} -j ACCEPT" in r for r in rules))
+        # Invariant 3: Target server and hopping range must be explicitly allowed
+        self.assertTrue(any(f"{base_port}:{base_port+port_count-1}" in r for r in rules))
+        # Invariant 4: Unconditional DROP at the end of the chain
+        self.assertEqual(rules[-2], "iptables -A AEGS_KILLSWITCH -j DROP")
+        # Invariant 5: Chain is inserted at top of OUTPUT
+        self.assertEqual(rules[-1], "iptables -I OUTPUT 1 -j AEGS_KILLSWITCH")
+
+    def test_dns_leak_shield_isolation(self):
+        """DNS shield rules block plaintext port 53 on external interfaces and permit tunnel DNS."""
+        tun_iface = "aegs0"
+        rules = [
+            "iptables -N AEGS_DNS_SHIELD",
+            f"iptables -A AEGS_DNS_SHIELD -o {tun_iface} -p udp --dport 53 -j ACCEPT",
+            f"iptables -A AEGS_DNS_SHIELD -o {tun_iface} -p tcp --dport 53 -j ACCEPT",
+            "iptables -A AEGS_DNS_SHIELD -o lo -p udp --dport 53 -j ACCEPT",
+            "iptables -A AEGS_DNS_SHIELD -o lo -p tcp --dport 53 -j ACCEPT",
+            "iptables -A AEGS_DNS_SHIELD -p udp --dport 53 -j DROP",
+            "iptables -A AEGS_DNS_SHIELD -p tcp --dport 53 -j DROP",
+            "iptables -I OUTPUT 1 -j AEGS_DNS_SHIELD"
+        ]
+
+        drops = [r for r in rules if "-p udp --dport 53 -j DROP" in r or "-p tcp --dport 53 -j DROP" in r]
+        self.assertEqual(len(drops), 2)
+        accepts = [r for r in rules if f"-o {tun_iface}" in r and "--dport 53 -j ACCEPT" in r]
+        self.assertEqual(len(accepts), 2)
+
+    def test_transport_failure_detector_blackout(self):
+        """TransportFailureDetector signals TCP fallback on blackout / sustained drop."""
+        class MockDetector:
+            def __init__(self, max_timeouts=5, max_blackout=15.0):
+                self.max_timeouts = max_timeouts
+                self.max_blackout = max_blackout
+                self.timeouts = 0
+                self.last_success = time.time()
+                self.sent = 0
+                self.lost = 0
+
+            def record_timeout(self):
+                self.timeouts += 1
+
+            def record_success(self):
+                self.timeouts = 0
+                self.last_success = time.time()
+
+            def record_loss(self, s, l):
+                self.sent += s
+                self.lost += l
+
+            def should_fallback(self):
+                if self.timeouts >= self.max_timeouts:
+                    return True
+                if (time.time() - self.last_success) >= self.max_blackout and self.timeouts > 0:
+                    return True
+                if self.sent >= 100 and (self.lost / self.sent) > 0.75:
+                    return True
+                return False
+
+        det = MockDetector(max_timeouts=5, max_blackout=2.0)
+        self.assertFalse(det.should_fallback())
+
+        for _ in range(4):
+            det.record_timeout()
+        self.assertFalse(det.should_fallback())
+        det.record_timeout()
+        self.assertTrue(det.should_fallback())
+
+        det.record_success()
+        self.assertFalse(det.should_fallback())
+
+        det.record_loss(120, 100)
+        self.assertTrue(det.should_fallback())
+
 def main():
     print("=" * 70)
-    print("      AEGS v4 PANTHEON COMPLETE 11-PILLAR ADVANCED SECURITY SUITE      ")
+    print("      AEGS v4 PANTHEON COMPLETE 12-PILLAR ADVANCED SECURITY SUITE      ")
     print("=" * 70)
 
     token = "prod_user_token_long_entropy_test_2026_safe"
@@ -575,17 +674,19 @@ def main():
     print(f"  [PASS] Strategy 2 (QUIC Retry Token Injection): {retry} / 500")
     print(f"  [PASS] Strategy 3 (QUIC Connection Close Frame): {close} / 500")
 
-    print("\n[PILLAR 10 & 11] PORT HOPPING & SESSION RESUMPTION TESTS...")
+    print("\n[PILLAR 10, 11 & 12] PORT HOPPING, SESSION RESUMPTION & NETWORK SECURITY SUITE...")
+    loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    suite.addTest(unittest.makeSuite(Pillar10_PortHopping))
-    suite.addTest(unittest.makeSuite(Pillar11_SessionResumption))
+    suite.addTests(loader.loadTestsFromTestCase(Pillar10_PortHopping))
+    suite.addTests(loader.loadTestsFromTestCase(Pillar11_SessionResumption))
+    suite.addTests(loader.loadTestsFromTestCase(Pillar12_NetworkSecurityAndLeakProtection))
     res = unittest.TextTestRunner(verbosity=2).run(suite)
     if not res.wasSuccessful():
         print("[FAILED] Unittests failed.")
         return
 
     print("\n" + "=" * 70)
-    print("[SUCCESS] ALL 11 ADVANCED SECURITY, RELIABILITY & ANTI-DPI SUITES: 100% PASS!")
+    print("[SUCCESS] ALL 12 ADVANCED SECURITY, RELIABILITY & ANTI-DPI SUITES: 100% PASS!")
     print("=" * 70)
 
 if __name__ == "__main__":

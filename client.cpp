@@ -23,6 +23,7 @@
 #include "traffic_shaper.h"
 #include "port_hopper.h"
 #include "session_resumption.h"
+#include "network_security.h"
 #include <optional>
 #include <memory>
 #include <poll.h>
@@ -162,7 +163,7 @@ uint16_t generate_junk_len() {
 }
 
 void usage(const char* argv0) {
-    std::cerr << "usage: " << argv0 << " <server_ip> <server_port> <token> [--no-tun]\n";
+    std::cerr << "usage: " << argv0 << " <server_ip> <server_port> <token> [--no-tun] [--kill-switch] [--dns-protect]\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -172,8 +173,13 @@ int main(int argc, char* argv[]) {
     int s_port = std::stoi(argv[2]);
     std::string token = argv[3];
     bool use_tun = true;
+    bool enable_kill_switch = (std::getenv("AEGS_KILL_SWITCH") != nullptr && std::string(std::getenv("AEGS_KILL_SWITCH")) == "1");
+    bool enable_dns_protect = (std::getenv("AEGS_DNS_PROTECT") != nullptr && std::string(std::getenv("AEGS_DNS_PROTECT")) == "1");
+
     for (int i = 4; i < argc; ++i) {
         if (!strcmp(argv[i], "--no-tun")) use_tun = false;
+        else if (!strcmp(argv[i], "--kill-switch")) enable_kill_switch = true;
+        else if (!strcmp(argv[i], "--dns-protect")) enable_dns_protect = true;
     }
 
     uint8_t raw_kid[8];
@@ -321,6 +327,17 @@ int main(int argc, char* argv[]) {
     TrafficShaper shaper(5, false);
     shaper.set_semantic_enabled(true);
 
+    KillSwitch kill_switch;
+    DnsLeakProtector dns_shield;
+    TransportFailureDetector transport_detector;
+
+    if (enable_kill_switch) {
+        kill_switch.enable(s_host, (uint16_t)s_port, port_count, "aegs0");
+    }
+    if (enable_dns_protect) {
+        dns_shield.enable("aegs0", "10.8.0.1");
+    }
+
     while (true) {
         int poll_ret = poll(pfds.data(), pfds.size(), 100);
         if (poll_ret < 0) break;
@@ -333,7 +350,20 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        if (poll_ret == 0) continue;
+        if (poll_ret == 0) {
+            transport_detector.record_timeout();
+            if (transport_detector.should_fallback_to_tcp()) {
+                static double last_warn = 0;
+                double now_sec = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+                if (now_sec - last_warn > 10.0) {
+                    std::cerr << "[AEGS v4 ALERT] Severe UDP timeout / blackout detected ("
+                              << transport_detector.consecutive_timeouts()
+                              << " timeouts). Recommending automatic TCP/TLS 1.3 fallback!\n";
+                    last_warn = now_sec;
+                }
+            }
+            continue;
+        }
 
         // UDP fd readable
         if (pfds[0].revents & POLLIN) {
@@ -373,6 +403,7 @@ int main(int argc, char* argv[]) {
 
                 size_t dlen = 0;
                 if (chacha20_poly1305_decrypt(ct, ct_len, session_keys.recv_key, aead_nonce, pbuf.data(), dlen)) {
+                    transport_detector.record_success();
                     if (dlen < 2) continue;
                     uint16_t plen = (pbuf[0] << 8) | pbuf[1];
                     if (use_tun) {
