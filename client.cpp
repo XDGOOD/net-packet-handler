@@ -73,83 +73,128 @@ bool hkdf_expand(const uint8_t* master_key, size_t master_key_len, const std::st
     return true;
 }
 
+// RAII thread_local EVP_CIPHER_CTX holder to guarantee zero heap allocations on the packet hot path
+struct ThreadLocalCipherCtx {
+    EVP_CIPHER_CTX* ctx = nullptr;
+
+    ThreadLocalCipherCtx() noexcept {
+        ctx = EVP_CIPHER_CTX_new();
+    }
+
+    ~ThreadLocalCipherCtx() {
+        if (ctx) {
+            EVP_CIPHER_CTX_free(ctx);
+            ctx = nullptr;
+        }
+    }
+
+    ThreadLocalCipherCtx(const ThreadLocalCipherCtx&) = delete;
+    ThreadLocalCipherCtx& operator=(const ThreadLocalCipherCtx&) = delete;
+};
+
 bool mask_unmask_header(const uint8_t* in, size_t len, const uint8_t* mask_key, const uint8_t* hdr_iv, uint8_t* out) {
     uint8_t full_iv[16] = {0};
     std::memcpy(full_iv + 4, hdr_iv, 12);
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+
+    thread_local ThreadLocalCipherCtx tl_ctx;
+    EVP_CIPHER_CTX* ctx = tl_ctx.ctx;
     if (!ctx) return false;
+    EVP_CIPHER_CTX_reset(ctx);
+
     int outlen = 0;
     if (EVP_CipherInit_ex(ctx, EVP_chacha20(), NULL, mask_key, full_iv, 1) != 1 ||
         EVP_CipherUpdate(ctx, out, &outlen, in, (int)len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
+        EVP_CIPHER_CTX_reset(ctx);
         return false;
     }
     int final_len = 0;
     EVP_CipherFinal_ex(ctx, out + outlen, &final_len);
-    EVP_CIPHER_CTX_free(ctx);
+    EVP_CIPHER_CTX_reset(ctx);
     return true;
 }
 
-bool chacha20_poly1305_encrypt(const uint8_t* pt, size_t pt_len, const uint8_t* key, const uint8_t* nonce, uint8_t* ct, size_t& ct_len) {
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+bool chacha20_poly1305_encrypt(const uint8_t* pt, size_t pt_len, const uint8_t* key, const uint8_t* nonce, uint8_t* ct, size_t& ct_len, const uint8_t* aad = nullptr, size_t aad_len = 0) {
+    thread_local ThreadLocalCipherCtx tl_ctx;
+    EVP_CIPHER_CTX* ctx = tl_ctx.ctx;
     if (!ctx) return false;
+    EVP_CIPHER_CTX_reset(ctx);
+
     if (EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) != 1 ||
         EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) != 1 ||
         EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) {
-        EVP_CIPHER_CTX_free(ctx); return false;
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
     }
-    int len;
-    if (EVP_EncryptUpdate(ctx, ct, &len, pt, (int)pt_len) != 1) { EVP_CIPHER_CTX_free(ctx); return false; }
+    int len = 0;
+    if (aad && aad_len > 0) {
+        if (EVP_EncryptUpdate(ctx, NULL, &len, aad, (int)aad_len) != 1) {
+            EVP_CIPHER_CTX_reset(ctx);
+            return false;
+        }
+    }
+    if (EVP_EncryptUpdate(ctx, ct, &len, pt, (int)pt_len) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
     int total_len = len;
-    if (EVP_EncryptFinal_ex(ctx, ct + len, &len) != 1) { EVP_CIPHER_CTX_free(ctx); return false; }
+    if (EVP_EncryptFinal_ex(ctx, ct + len, &len) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
     total_len += len;
     uint8_t tag[16];
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag) != 1) { EVP_CIPHER_CTX_free(ctx); return false; }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
     std::memcpy(ct + total_len, tag, 16);
     ct_len = total_len + 16;
-    EVP_CIPHER_CTX_free(ctx); return true;
+    EVP_CIPHER_CTX_reset(ctx);
+    return true;
 }
 
-bool chacha20_poly1305_decrypt(const uint8_t* ct, size_t ct_len, const uint8_t* key, const uint8_t* nonce, uint8_t* pt, size_t& pt_len) {
+bool chacha20_poly1305_decrypt(const uint8_t* ct, size_t ct_len, const uint8_t* key, const uint8_t* nonce, uint8_t* pt, size_t& pt_len, const uint8_t* aad = nullptr, size_t aad_len = 0) {
     if (ct_len < 16) return false;
-    size_t c_len = ct_len - 16; const uint8_t* tag = ct + c_len;
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    size_t c_len = ct_len - 16;
+    const uint8_t* tag = ct + c_len;
+
+    thread_local ThreadLocalCipherCtx tl_ctx;
+    EVP_CIPHER_CTX* ctx = tl_ctx.ctx;
     if (!ctx) return false;
+    EVP_CIPHER_CTX_reset(ctx);
+
     if (EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) != 1 ||
         EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) != 1 ||
         EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) {
-        EVP_CIPHER_CTX_free(ctx); return false;
-    }
-    int len;
-    if (EVP_DecryptUpdate(ctx, pt, &len, ct, (int)c_len) != 1) { EVP_CIPHER_CTX_free(ctx); return false; }
-    int total_len = len;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, const_cast<uint8_t*>(tag)) != 1) { EVP_CIPHER_CTX_free(ctx); return false; }
-    if (EVP_DecryptFinal_ex(ctx, pt + len, &len) <= 0) { EVP_CIPHER_CTX_free(ctx); return false; }
-    total_len += len;
-    pt_len = total_len;
-    EVP_CIPHER_CTX_free(ctx); return true;
-}
-
-class AntiReplayFilter {
-    uint64_t last_seq = 0;
-    uint64_t bitmap = 0;
-public:
-    bool check_and_update(uint64_t seq) {
-        if (seq == 0) return true;
-        if (seq > last_seq) {
-            uint64_t diff = seq - last_seq;
-            if (diff < 64) bitmap = (bitmap << diff) | 1ULL;
-            else bitmap = 1ULL;
-            last_seq = seq;
-            return false;
-        }
-        uint64_t diff = last_seq - seq;
-        if (diff >= 64) return true;
-        if (bitmap & (1ULL << diff)) return true;
-        bitmap |= (1ULL << diff);
+        EVP_CIPHER_CTX_reset(ctx);
         return false;
     }
-};
+    int len = 0;
+    if (aad && aad_len > 0) {
+        if (EVP_DecryptUpdate(ctx, NULL, &len, aad, (int)aad_len) != 1) {
+            EVP_CIPHER_CTX_reset(ctx);
+            return false;
+        }
+    }
+    if (EVP_DecryptUpdate(ctx, pt, &len, ct, (int)c_len) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
+    int total_len = len;
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, const_cast<uint8_t*>(tag)) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
+    if (EVP_DecryptFinal_ex(ctx, pt + len, &len) <= 0) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
+    total_len += len;
+    pt_len = total_len;
+    EVP_CIPHER_CTX_reset(ctx);
+    return true;
+}
+
 
 size_t secure_pad_len() {
     uint8_t b; RAND_bytes(&b, 1);
@@ -192,9 +237,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    uint8_t mask_key[32], fallback_payload_key[32];
-    if (!hkdf_expand(master_key, 32, "aegis-v2-header-mask", mask_key, 32) ||
-        !hkdf_expand(master_key, 32, "aegis-v2-payload-key", fallback_payload_key, 32)) {
+    uint8_t mask_key[32];
+    if (!hkdf_expand(master_key, 32, "aegis-v2-header-mask", mask_key, 32)) {
         std::cerr << "HKDF expansion failed\n";
         return 1;
     }
@@ -255,7 +299,7 @@ int main(int argc, char* argv[]) {
             struct sockaddr_in src; socklen_t slen = sizeof(src);
             std::vector<uint8_t> resp(BUFFER_SIZE);
             ssize_t len = recvfrom(fd, resp.data(), resp.size(), 0, (struct sockaddr*)&src, &slen);
-            if (len > 0 && hc.process_resp(resp.data(), len, session_keys)) {
+            if (len > 0 && src.sin_addr.s_addr == s_addr.sin_addr.s_addr && hc.process_resp(resp.data(), len, session_keys)) {
                 assigned_ip = session_keys.assigned_ip;
                 mtu = session_keys.mtu;
                 handshake_ok = true;
@@ -402,14 +446,17 @@ int main(int argc, char* argv[]) {
                 size_t ct_len = len - (aead_offset + 12);
 
                 size_t dlen = 0;
-                if (chacha20_poly1305_decrypt(ct, ct_len, session_keys.recv_key, aead_nonce, pbuf.data(), dlen)) {
+                // FIX Blocker 3: Authenticate outer header as AAD in AEAD Poly1305
+                if (chacha20_poly1305_decrypt(ct, ct_len, session_keys.recv_key, aead_nonce, pbuf.data(), dlen, buf.data(), aead_offset)) {
                     transport_detector.record_success();
                     if (dlen < 2) continue;
                     uint16_t plen = (pbuf[0] << 8) | pbuf[1];
-                    if (use_tun) {
-                        tun->write_packet(pbuf.data() + 2, plen);
-                    } else if (has_wg && plen <= dlen - 2) {
-                        sendto(fd, pbuf.data() + 2, plen, 0, (struct sockaddr*)&wg_addr, sizeof(wg_addr));
+                    if (plen > 0 && plen <= dlen - 2) {
+                        if (use_tun) {
+                            tun->write_packet(pbuf.data() + 2, plen);
+                        } else if (has_wg) {
+                            sendto(fd, pbuf.data() + 2, plen, 0, (struct sockaddr*)&wg_addr, sizeof(wg_addr));
+                        }
                     }
                 }
             } else if (len > 0 && !use_tun) {
@@ -419,19 +466,17 @@ int main(int argc, char* argv[]) {
                 size_t pad_len = shaper.semantic_pad((size_t)len);
                 size_t frame_len = FRAME_HDR + (size_t)len + pad_len;
                 if (frame_len + TAG_LEN > pbuf.size()) { pad_len = 0; frame_len = FRAME_HDR + (size_t)len; }
+                if (frame_len + TAG_LEN > pbuf.size()) continue;
 
                 uint16_t plen_be = htons((uint16_t)len);
                 std::memcpy(pbuf.data(), &plen_be, 2);
                 std::memcpy(pbuf.data() + 2, buf.data(), len);
-                if (pad_len > 0) RAND_bytes(pbuf.data() + 2 + len, (int)pad_len);
+                if (pad_len > 0) TrafficShaper::fill_random_padding(pbuf.data() + 2 + len, pad_len);
 
                 uint8_t aead_nonce[12] = {0};
                 client_tx_seq++;
                 std::memcpy(aead_nonce, &client_tx_seq, sizeof(uint64_t));
                 RAND_bytes(aead_nonce + 8, 4);
-
-                size_t elen = 0;
-                if (!chacha20_poly1305_encrypt(pbuf.data(), frame_len, session_keys.send_key, aead_nonce, cbuf.data(), elen)) continue;
 
                 uint16_t junk_len = generate_junk_len();
 
@@ -451,7 +496,12 @@ int main(int argc, char* argv[]) {
                 std::memcpy(out_buf.data(), hdr_iv, 12); out_len += 12;
                 std::memcpy(out_buf.data() + out_len, masked_hdr, 16); out_len += 16;
                 if (junk_len > 0) { RAND_bytes(out_buf.data() + out_len, (int)junk_len); out_len += junk_len; }
+                size_t aead_offset = out_len;
                 std::memcpy(out_buf.data() + out_len, aead_nonce, 12); out_len += 12;
+
+                size_t elen = 0;
+                // FIX Blocker 3: Authenticate outer header as AAD in AEAD Poly1305
+                if (!chacha20_poly1305_encrypt(pbuf.data(), frame_len, session_keys.send_key, aead_nonce, cbuf.data(), elen, out_buf.data(), aead_offset)) continue;
                 std::memcpy(out_buf.data() + out_len, cbuf.data(), elen); out_len += elen;
 
                 s_addr.sin_port = htons(hopper.current_port(session_keys.send_key));
@@ -467,19 +517,17 @@ int main(int argc, char* argv[]) {
                 size_t pad_len = shaper.semantic_pad((size_t)len);
                 size_t frame_len = FRAME_HDR + (size_t)len + pad_len;
                 if (frame_len + TAG_LEN > pbuf.size()) { pad_len = 0; frame_len = FRAME_HDR + (size_t)len; }
+                if (frame_len + TAG_LEN > pbuf.size()) continue;
 
                 uint16_t plen_be = htons((uint16_t)len);
                 std::memcpy(pbuf.data(), &plen_be, 2);
                 std::memcpy(pbuf.data() + 2, buf.data(), len);
-                if (pad_len > 0) RAND_bytes(pbuf.data() + 2 + len, (int)pad_len);
+                if (pad_len > 0) TrafficShaper::fill_random_padding(pbuf.data() + 2 + len, pad_len);
 
                 uint8_t aead_nonce[12] = {0};
                 client_tx_seq++;
                 std::memcpy(aead_nonce, &client_tx_seq, sizeof(uint64_t));
                 RAND_bytes(aead_nonce + 8, 4);
-
-                size_t elen = 0;
-                if (!chacha20_poly1305_encrypt(pbuf.data(), frame_len, session_keys.send_key, aead_nonce, cbuf.data(), elen)) continue;
 
                 uint16_t junk_len = generate_junk_len();
 
@@ -499,7 +547,12 @@ int main(int argc, char* argv[]) {
                 std::memcpy(out_buf.data(), hdr_iv, 12); out_len += 12;
                 std::memcpy(out_buf.data() + out_len, masked_hdr, 16); out_len += 16;
                 if (junk_len > 0) { RAND_bytes(out_buf.data() + out_len, (int)junk_len); out_len += junk_len; }
+                size_t aead_offset = out_len;
                 std::memcpy(out_buf.data() + out_len, aead_nonce, 12); out_len += 12;
+
+                size_t elen = 0;
+                // FIX Blocker 3: Authenticate outer header as AAD in AEAD Poly1305
+                if (!chacha20_poly1305_encrypt(pbuf.data(), frame_len, session_keys.send_key, aead_nonce, cbuf.data(), elen, out_buf.data(), aead_offset)) continue;
                 std::memcpy(out_buf.data() + out_len, cbuf.data(), elen); out_len += elen;
 
                 s_addr.sin_port = htons(hopper.current_port(session_keys.send_key));

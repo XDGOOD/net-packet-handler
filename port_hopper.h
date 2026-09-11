@@ -39,6 +39,11 @@ public:
     std::pair<uint16_t, uint16_t>
     port_window(const uint8_t session_key[32]) const noexcept;
 
+    // Server side: validates if received_port matches the expected port for session_key
+    // in the current epoch or neighboring epochs (epoch - 1, epoch + 1) to absorb
+    // network transit delay and clock skew across port hopping rotations.
+    bool is_valid_port(const uint8_t session_key[32], uint16_t received_port) const noexcept;
+
     // Accessors
     uint16_t base_port()        const noexcept { return base_port_; }
     int      count()            const noexcept { return count_; }

@@ -22,6 +22,8 @@
 #include "illusion_prebypass.h"
 #include "chaff_engine.h"
 #include "blackhole_responder.h"
+#include "protocol_mimicry.h"
+#include "network_security.h"
 
 const std::string VER_MAGIC = "AG2\x01";
 const int PBKDF2_ITERATIONS = 200000;
@@ -30,30 +32,6 @@ const size_t PAD_MAX = 256;
 const size_t FRAME_HDR = 2;
 const size_t TAG_LEN = 16;
 
-// RFC 6479 / Linux WireGuard 64-bit Sliding Window Anti-Replay Filter
-class AntiReplayFilter {
-    uint64_t last_seq = 0;
-    uint64_t bitmap = 0;
-public:
-    bool check_and_update(uint64_t seq) {
-        if (seq == 0) return true;
-        if (seq > last_seq) {
-            uint64_t diff = seq - last_seq;
-            if (diff < 64) {
-                bitmap = (bitmap << diff) | 1ULL;
-            } else {
-                bitmap = 1ULL;
-            }
-            last_seq = seq;
-            return false;
-        }
-        uint64_t diff = last_seq - seq;
-        if (diff >= 64) return true;
-        if (bitmap & (1ULL << diff)) return true;
-        bitmap |= (1ULL << diff);
-        return false;
-    }
-};
 
 bool derive_master_key(const std::string& token, const std::string& salt, uint8_t* master_key_out) {
     return PKCS5_PBKDF2_HMAC(token.c_str(), (int)token.length(),
@@ -77,62 +55,128 @@ bool hkdf_expand(const uint8_t* master_key, size_t master_key_len, const std::st
     return true;
 }
 
+// RAII thread_local EVP_CIPHER_CTX holder to guarantee zero heap allocations on the packet hot path
+struct ThreadLocalCipherCtx {
+    EVP_CIPHER_CTX* ctx = nullptr;
+
+    ThreadLocalCipherCtx() noexcept {
+        ctx = EVP_CIPHER_CTX_new();
+    }
+
+    ~ThreadLocalCipherCtx() {
+        if (ctx) {
+            EVP_CIPHER_CTX_free(ctx);
+            ctx = nullptr;
+        }
+    }
+
+    ThreadLocalCipherCtx(const ThreadLocalCipherCtx&) = delete;
+    ThreadLocalCipherCtx& operator=(const ThreadLocalCipherCtx&) = delete;
+};
+
 bool mask_unmask_header(const uint8_t* in, size_t len, const uint8_t* mask_key, const uint8_t* hdr_iv, uint8_t* out) {
     uint8_t full_iv[16] = {0};
     std::memcpy(full_iv + 4, hdr_iv, 12); // ChaCha20 uses 4-byte counter + 12-byte IV
 
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    thread_local ThreadLocalCipherCtx tl_ctx;
+    EVP_CIPHER_CTX* ctx = tl_ctx.ctx;
     if (!ctx) return false;
+    EVP_CIPHER_CTX_reset(ctx);
+
     int outlen = 0;
     if (EVP_CipherInit_ex(ctx, EVP_chacha20(), NULL, mask_key, full_iv, 1) != 1 ||
         EVP_CipherUpdate(ctx, out, &outlen, in, (int)len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
+        EVP_CIPHER_CTX_reset(ctx);
         return false;
     }
     int final_len = 0;
     EVP_CipherFinal_ex(ctx, out + outlen, &final_len);
-    EVP_CIPHER_CTX_free(ctx);
+    EVP_CIPHER_CTX_reset(ctx);
     return true;
 }
 
-bool chacha20_poly1305_encrypt(const uint8_t* pt, size_t pt_len, const uint8_t* key, const uint8_t* nonce, uint8_t* ct, size_t& ct_len) {
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+bool chacha20_poly1305_encrypt(const uint8_t* pt, size_t pt_len, const uint8_t* key, const uint8_t* nonce, uint8_t* ct, size_t& ct_len, const uint8_t* aad = nullptr, size_t aad_len = 0) {
+    thread_local ThreadLocalCipherCtx tl_ctx;
+    EVP_CIPHER_CTX* ctx = tl_ctx.ctx;
     if (!ctx) return false;
+    EVP_CIPHER_CTX_reset(ctx);
+
     if (EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) != 1 ||
         EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) != 1 ||
         EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) {
-        EVP_CIPHER_CTX_free(ctx); return false;
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
     }
-    int len;
-    if (EVP_EncryptUpdate(ctx, ct, &len, pt, (int)pt_len) != 1) { EVP_CIPHER_CTX_free(ctx); return false; }
+    int len = 0;
+    if (aad && aad_len > 0) {
+        if (EVP_EncryptUpdate(ctx, NULL, &len, aad, (int)aad_len) != 1) {
+            EVP_CIPHER_CTX_reset(ctx);
+            return false;
+        }
+    }
+    if (EVP_EncryptUpdate(ctx, ct, &len, pt, (int)pt_len) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
     int total_len = len;
-    if (EVP_EncryptFinal_ex(ctx, ct + len, &len) != 1) { EVP_CIPHER_CTX_free(ctx); return false; }
+    if (EVP_EncryptFinal_ex(ctx, ct + len, &len) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
     total_len += len;
     uint8_t tag[16];
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag) != 1) { EVP_CIPHER_CTX_free(ctx); return false; }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
     std::memcpy(ct + total_len, tag, 16);
     ct_len = total_len + 16;
-    EVP_CIPHER_CTX_free(ctx); return true;
+    EVP_CIPHER_CTX_reset(ctx);
+    return true;
 }
 
-bool chacha20_poly1305_decrypt(const uint8_t* ct, size_t ct_len, const uint8_t* key, const uint8_t* nonce, uint8_t* pt, size_t& pt_len) {
+bool chacha20_poly1305_decrypt(const uint8_t* ct, size_t ct_len, const uint8_t* key, const uint8_t* nonce, uint8_t* pt, size_t& pt_len, const uint8_t* aad = nullptr, size_t aad_len = 0) {
     if (ct_len < 16) return false;
-    size_t c_len = ct_len - 16; const uint8_t* tag = ct + c_len;
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    size_t c_len = ct_len - 16;
+    const uint8_t* tag = ct + c_len;
+
+    thread_local ThreadLocalCipherCtx tl_ctx;
+    EVP_CIPHER_CTX* ctx = tl_ctx.ctx;
     if (!ctx) return false;
+    EVP_CIPHER_CTX_reset(ctx);
+
     if (EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) != 1 ||
         EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) != 1 ||
-        EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, (void*)tag) != 1) {
-        EVP_CIPHER_CTX_free(ctx); return false;
+        EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
     }
-    int len;
-    if (EVP_DecryptUpdate(ctx, pt, &len, ct, (int)c_len) != 1) { EVP_CIPHER_CTX_free(ctx); return false; }
+    int len = 0;
+    if (aad && aad_len > 0) {
+        if (EVP_DecryptUpdate(ctx, NULL, &len, aad, (int)aad_len) != 1) {
+            EVP_CIPHER_CTX_reset(ctx);
+            return false;
+        }
+    }
+    if (EVP_DecryptUpdate(ctx, pt, &len, ct, (int)c_len) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
     int total_len = len;
-    if (EVP_DecryptFinal_ex(ctx, pt + len, &len) != 1) { EVP_CIPHER_CTX_free(ctx); return false; }
-    pt_len = total_len + len;
-    EVP_CIPHER_CTX_free(ctx); return true;
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, const_cast<uint8_t*>(tag)) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
+    if (EVP_DecryptFinal_ex(ctx, pt + len, &len) <= 0) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
+    total_len += len;
+    pt_len = total_len;
+    EVP_CIPHER_CTX_reset(ctx);
+    return true;
 }
+
 
 double calculate_entropy(const uint8_t* data, size_t len) {
     if (len == 0) return 0.0;
@@ -228,7 +272,7 @@ int main() {
     // -------------------------------------------------------------
     std::cout << "\n[PILLAR 3] DATA INTEGRITY, TAMPERING & SLIDING WINDOW ANTI-REPLAY..." << std::endl;
     
-    // Test RFC 6479 Anti-Replay Filter
+    // Test RFC 6479 Multi-Word Anti-Replay Filter (2048-packet window, Audit Issue 5.2)
     AntiReplayFilter rf;
     assert(!rf.check_and_update(1)); // Valid seq 1
     assert(!rf.check_and_update(2)); // Valid seq 2
@@ -239,8 +283,22 @@ int main() {
     assert(!rf.check_and_update(4)); // Valid in-window seq 4
     assert(rf.check_and_update(3));  // Replay seq 3 -> REJECTED
     assert(!rf.check_and_update(100)); // Jump window to 100
-    assert(rf.check_and_update(20)); // Out of window (< 100-64) -> REJECTED
-    std::cout << "  [PASS] 64-bit Sliding Window Anti-Replay Filter: 100% Deterministic (Zero Allocations)" << std::endl;
+    // In expanded 2048 window, seq 20 is valid out-of-order (100-20=80 < 2048) -> ACCEPTED
+    assert(!rf.check_and_update(20)); // Valid out-of-order in 2048 window
+    assert(rf.check_and_update(20));  // Replay seq 20 -> REJECTED
+    assert(!rf.check_and_update(3000)); // Jump window to 3000
+    assert(rf.check_and_update(20));  // Out of window (< 3000-2048) -> REJECTED
+
+    // Backwards compatibility verification for 64-packet single-word window
+    AntiReplayFilter64 rf64;
+    assert(!rf64.check_and_update(1));
+    assert(!rf64.check_and_update(2));
+    assert(rf64.check_and_update(1));
+    assert(!rf64.check_and_update(100));
+    assert(rf64.check_and_update(20)); // Out of window (< 100-64) -> REJECTED
+
+    std::cout << "  [PASS] RFC 6479 Multi-Word (" << AntiReplayFilter::WINDOW_SIZE
+              << "-packet) Anti-Replay Filter: 100% Deterministic (Zero Allocations)" << std::endl;
 
     int tamper_blocked = 0;
     for (int flip = 0; flip < 50; ++flip) {
@@ -364,26 +422,31 @@ int main() {
     // PILLAR 7: State-Machine Pre-Bypass (RFC 5389 STUN & RFC 9000 QUIC)
     // -------------------------------------------------------------
     std::cout << "\n[PILLAR 7] STATE-MACHINE PRE-BYPASS DECOY VERIFICATION..." << std::endl;
-    // 1. Verify STUN Binding Request
+    // 1. Verify STUN Binding Request (RFC 5389 with USERNAME & FINGERPRINT attributes)
     auto stun_pkt = IllusionPreBypass::generate_stun_binding();
-    assert(stun_pkt.size() == 20);
+    assert(stun_pkt.size() == 40);
     assert(stun_pkt[0] == 0x00 && stun_pkt[1] == 0x01); // RFC 5389 Binding Request
-    assert(stun_pkt[2] == 0x00 && stun_pkt[3] == 0x00); // 0 body length
+    assert(stun_pkt[2] == 0x00 && stun_pkt[3] == 0x14); // 20 bytes attribute length
     // Magic Cookie: 0x2112A442
     assert(stun_pkt[4] == 0x21 && stun_pkt[5] == 0x12 && stun_pkt[6] == 0xA4 && stun_pkt[7] == 0x42);
+    // Attribute USERNAME (0x0006)
+    assert(stun_pkt[20] == 0x00 && stun_pkt[21] == 0x06);
+    // Attribute FINGERPRINT (0x8028)
+    assert(stun_pkt[32] == 0x80 && stun_pkt[33] == 0x28);
     // Ensure transaction ID is randomized across runs
     auto stun_pkt2 = IllusionPreBypass::generate_stun_binding();
     assert(std::memcmp(&stun_pkt[8], &stun_pkt2[8], 12) != 0);
-    std::cout << "  [PASS] RFC 5389 STUN Binding Request Decoy: Format & Magic Cookie Verified" << std::endl;
+    std::cout << "  [PASS] RFC 5389 STUN Binding Request Decoy: Format, Attributes & FINGERPRINT Verified" << std::endl;
 
     // 2. Verify QUIC Initial Packet
     auto quic_pkt = IllusionPreBypass::generate_quic_initial();
     assert(quic_pkt.size() >= 1200); // RFC 9000 min MTU requirement
     assert(quic_pkt[0] == 0xC3);    // Long Header + Initial
     assert(quic_pkt[1] == 0x00 && quic_pkt[2] == 0x00 && quic_pkt[3] == 0x00 && quic_pkt[4] == 0x01); // QUIC v1
+    assert(quic_pkt[24] == 0x44 && quic_pkt[25] == 0x96); // Exact RFC 9000 length varint (1174 bytes)
     auto quic_pkt2 = IllusionPreBypass::generate_quic_initial();
     assert(std::memcmp(&quic_pkt[6], &quic_pkt2[6], 8) != 0); // Randomized DCID
-    std::cout << "  [PASS] RFC 9000 QUIC Initial Decoy: MTU (1200B) & Long Header Verified" << std::endl;
+    std::cout << "  [PASS] RFC 9000 QUIC Initial Decoy: MTU (1200B), Long Header & Exact Varint Verified" << std::endl;
 
     // -------------------------------------------------------------
     // PILLAR 8: Active Chaffing & Server-Side Silent Drop
@@ -440,6 +503,23 @@ int main() {
     assert(blackhole.should_respond("192.0.2.1", test_time + 0.25));  // Allowed after 0.25s
     assert(blackhole.should_respond("192.0.2.2", test_time + 0.05));  // Different IP is independent
 
+    // 1b. Amplification prevention test (Audit issue 4.4): short probes (< 20 bytes) must drop silently
+    uint8_t short_probe[10] = {0};
+    assert(blackhole.generate_response(short_probe, 10).empty());
+    assert(blackhole.generate_response(short_probe, 0).empty());
+    assert(blackhole.generate_response(short_probe, 19).empty());
+
+    // 1c. Upper ceiling enforcement test (Audit issue 4.4): enforce packet ceiling per IP
+    std::string ceiling_ip = "192.0.2.99";
+    double c_time = 10000.0;
+    size_t allowed_pkts = 0;
+    while (blackhole.should_respond(ceiling_ip, c_time)) {
+        allowed_pkts++;
+        c_time += 0.25;
+    }
+    assert(allowed_pkts <= BlackholeResponder::kMaxPacketsPerIp);
+    assert(!blackhole.should_respond(ceiling_ip, c_time + 0.25)); // Ceiled
+
     // 2. Diversity test across 3 strategies
     int vneg_count = 0, retry_count = 0, close_count = 0;
     for (int i = 0; i < 500; ++i) {
@@ -468,6 +548,35 @@ int main() {
     std::cout << "  [PASS] Adaptive Strategy 2 (QUIC Retry Token Injection): " << retry_count << " / 500" << std::endl;
     std::cout << "  [PASS] Adaptive Strategy 3 (QUIC Connection Close Frame): " << close_count << " / 500" << std::endl;
     assert(vneg_count > 0 && retry_count > 0 && close_count > 0);
+
+    // 3. Protocol Mimicry verification (Audit issue 4.3): dynamic versions, randomized CIDs, zero static signatures
+    ProtocolMimicry pm(ProtocolMimicry::Mode::QUIC_INITIAL);
+    uint8_t pkt_buf1[256] = {0};
+    uint8_t pkt_buf2[256] = {0};
+    uint8_t seed[2] = {0xAA, 0xBB};
+    size_t w1 = pm.wrap(pkt_buf1, 32, sizeof(pkt_buf1), seed);
+    size_t w2 = ProtocolMimicry::wrap_quic_initial(pkt_buf2, 32, sizeof(pkt_buf2));
+    assert(w1 == 32 + 24);
+    assert(w2 == 32 + 24);
+    assert(pm.header_size() == 24);
+    assert(pm.unwrap_offset() == 24);
+    // Verify CIDs are randomized across invocations
+    assert(std::memcmp(&pkt_buf1[6], &pkt_buf2[6], 8) != 0);   // DCID randomized
+    assert(std::memcmp(&pkt_buf1[15], &pkt_buf2[15], 8) != 0); // SCID randomized
+    // Verify static 6-byte signature 0xC0 00 00 00 01 08 is eliminated
+    static const uint8_t old_static_sig[6] = {0xC0, 0x00, 0x00, 0x00, 0x01, 0x08};
+    assert(std::memcmp(pkt_buf1, old_static_sig, 6) != 0 || std::memcmp(pkt_buf2, old_static_sig, 6) != 0);
+    std::cout << "  [PASS] Protocol Mimicry: RFC 9000 Randomized CIDs & Dynamic Versions Verified" << std::endl;
+
+    // 4. PortHopper window and server-side valid port verification
+    PortHopper hopper_test(51820, 8, 30);
+    uint8_t test_sess_key[32];
+    RAND_bytes(test_sess_key, 32);
+    uint16_t cur_p = hopper_test.current_port(test_sess_key);
+    assert(cur_p >= 51820 && cur_p < 51828);
+    assert(hopper_test.is_valid_port(test_sess_key, cur_p));
+    assert(!hopper_test.is_valid_port(test_sess_key, 9999));
+    std::cout << "  [PASS] PortHopper: Bounded Dynamic Window & is_valid_port Verification" << std::endl;
 
     std::cout << "\n=================================================================" << std::endl;
     std::cout << "🎉 ALL 9 ADVANCED SECURITY, RELIABILITY & ANTI-DPI SUITES: 100% PASS!" << std::endl;

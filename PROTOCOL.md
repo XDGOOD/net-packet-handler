@@ -1,8 +1,8 @@
-# AEGS v3 Protocol Specification
+# AEGS v4 Pantheon Protocol Specification
 
 ## 1. Introduction
-- Problem: stateful DPI systems (ТСПУ, GFW, Cloudflare Magic Firewall) identify VPN protocols by static signatures
-- Solution: AEGS v3 — transport protocol with per-packet randomized wire format
+- Problem: stateful DPI systems (ТСПУ, GFW, Cloudflare Magic Firewall) identify VPN protocols by static signatures and flow behavior
+- Solution: AEGS v4 — transport protocol with per-packet randomized wire format, header masking, and behavioral evasion
 - Scope: UDP transport, IPv4 tunneling, multi-user
 
 ## 2. Terminology
@@ -49,24 +49,26 @@ Offset  Len  Field
 1       7    Reserved = 0x00...
 8       8    SessionID (random uint64)
 16      32   ServerEphemeralPublicKey (X25519)
-48      16   EncryptedConfig = ChaCha20-Poly1305({AssignedIP[4], MTU[2], zeros[10]})
+48      16   EncryptedConfig = ChaCha20-Poly1305({AssignedIP[4], MTU[2], zeros[10]}, key=ConfigKey, nonce=0, AAD=Header[0..48])
 64      16   AEAD_Tag (Poly1305 authentication tag for EncryptedConfig)
 ```
 
 ### 4.3 Session Key Derivation
 ```
 SharedSecret = X25519(ClientEphPri, ServerEphPub)
-C2S_Key = HKDF(SharedSecret, salt=KeyID, info="aegs-c2s", len=32)
-S2C_Key = HKDF(SharedSecret, salt=KeyID, info="aegs-s2c", len=32)
+ConfigKey = HKDF(SharedSecret, salt=MasterKey, info="aegs-cfg", len=32)
+C2S_Key   = HKDF(SharedSecret, salt=MasterKey, info="aegs-c2s", len=32)
+S2C_Key   = HKDF(SharedSecret, salt=MasterKey, info="aegs-s2c", len=32)
 ```
 Provides Perfect Forward Secrecy: session keys are ephemeral and not recoverable from Token.
-No fallback to pre-shared keys — handshake failure results in explicit abort with retry.
+`MasterKey` is used as HKDF salt to prevent MITM ephemeral tampering.
+`ConfigKey` separates handshake response configuration encryption from data-plane S2C traffic to guarantee cryptographic domain separation and prevent nonce reuse attacks.
 
 ## 5. Data Packet Format
 
 ### 5.1 Wire Packet Structure
 ```
-+------------------+------------------+------------ +----------+------------------+
++------------------+------------------+-------------+----------+------------------+
 | HDR_IV (12)      | MASKED_HDR (16)  | JUNK (0-N)  | NONCE(12)| CIPHERTEXT (var) |
 +------------------+------------------+-------------+----------+------------------+
 ```
@@ -76,14 +78,16 @@ All fields in order:
 - `MASKED_HDR` (16 bytes): ChaCha20(PlainHDR, MaskKey, 0x00000000||HDR_IV)
 - `JUNK` (0-N bytes): random bytes, length encoded in PlainHDR
 - `AEAD_NONCE` (12 bytes): first 8 bytes = tx_seq (little-endian uint64), last 4 = random
-- `CIPHERTEXT`: ChaCha20-Poly1305(FRAME, SessionKey|PayloadKey, AEAD_NONCE)
+- `CIPHERTEXT`: ChaCha20-Poly1305(FRAME, SessionKey, AEAD_NONCE, AAD=OuterHeader)
+  * Note: Outer header `[HDR_IV || MASKED_HDR || JUNK]` is bound as Additional Authenticated Data (AAD) to prevent wire tampering.
 
 ### 5.2 PlainHDR Structure (16 bytes, before masking)
 ```
 Offset  Len  Field
 0       8    KeyID
 8       2    JunkLen (big-endian uint16)
-10      2    Reserved = 0x0000
+10      1    ChaffFlag (0x80 = chaff, 0x00 = data)
+11      1    Reserved = 0x00
 12      4    VER_MAGIC = 0x41473201 ("AG2\x01")
 ```
 
@@ -98,8 +102,7 @@ Offset  Len   Field
 ```
 
 ## 6. Anti-Replay
-64-bit sliding window per RFC 6479:
-- Window size: 64 packets
+Sliding window per RFC 6479 (2048 packets window):
 - Reject: seq == 0, seq older than window, seq already seen
 - Accept: new seq (advance window), out-of-order within window
 
@@ -112,111 +115,59 @@ Offset  Len   Field
 ## 8. DPI Evasion Properties (AEGS v4 Pantheon)
 
 ### 8.1 State-Machine Pre-Bypass ("AEGS Illusion")
-Before sending `HANDSHAKE_INIT`, the client transmits 1-3 decoy packets that perfectly
-mimic standard STUN Binding Requests (RFC 5389) or QUIC Initial packets (RFC 9000).
-
-**Effect:** DPI state machines classify the flow as `App: STUN / WebRTC` or `App: HTTP/3`
-and stop deep inspection. The real cryptographic handshake proceeds under this cover identity.
-
-Module: `illusion_prebypass.h/cpp`
+Before sending `HANDSHAKE_INIT`, the client transmits decoy packets mimicking standard STUN Binding Requests (RFC 5389) or QUIC Initial packets (RFC 9000).
+- **Current Behavior:** Decoys prime stateless / first-packet DPI heuristics into classifying the 5-tuple as WebRTC or HTTP/3.
+- **Limitation & Threat Model:** Stateful DPI reassembling full bidirectional flows expects a matching STUN Success Response or QUIC ServerHello. An unmatched request followed by opaque high-entropy traffic can be flagged as an anomaly by advanced deep state trackers. Full in-band transaction spoofing is recommended against advanced stateful inspection.
 
 ### 8.2 Semantic Padding ("Bimodal Shaping" — Anti-ML)
-Replaces uniform random padding (32-256 bytes) with intelligent bimodal shaping:
+Replaces uniform random padding with intelligent bimodal shaping:
 - Small packets (≤200 B) → padded to ~256 B (QUIC ACK profile, ±16 B jitter)
 - Large packets (>200 B) → padded to ~1350 B (full MTU QUIC frame, ±32 B jitter)
-- 5% probability of medium packets (512-768 B) to prevent fingerprinting the bimodal itself
-
-**Effect:** ML classifiers see a packet-size distribution indistinguishable from
-YouTube / QUIC browsing traffic. Configured via `AEGS_SEMANTIC_PADDING=1`.
-
-Module: `traffic_shaper.h/cpp` (`semantic_pad()` method)
+- 5% probability of medium packets (512-768 B) to prevent fingerprinting the bimodal distribution itself.
 
 ### 8.3 Active Chaffing (Anti-Timing Analysis)
-During idle periods (>500 ms since last real packet), the client generates chaff packets
-at random 50-200 ms intervals. Chaff packets use the standard AEGS wire format with
-bit `0x80` set in PlainHDR byte 10 (Reserved field). The server authenticates and then
-silently drops them without forwarding to TUN.
-
-**Effect:** To an observer, the tunnel looks like a continuous WebRTC voice call with
-constant packet flow, masking real user activity timing patterns.
-
-Module: `chaff_engine.h/cpp`
+During idle periods, client generates chaff packets. Chaff packets use the standard AEGS wire frame with bit `0x80` set in PlainHDR byte 10. Server authenticates and silently discards them.
+- **Threat Model & Battery Considerations:** Continuous 50-200 ms constant-rate chaffing draws substantial battery and cellular data on mobile devices, and lacks real WebRTC codec dynamics (Voice Activity Detection / DTX pauses). Adaptive burst-and-silence shaping with exponential backoff on sustained idle (>15s) is required for mobile profiles.
 
 ### 8.4 Cryptographic Blackhole (Anti Active Probing)
-When receiving invalid probe packets, the server responds with realistic QUIC packets
-derived from the probe's own entropy:
-- QUIC Version Negotiation (60%) — echoes probe CIDs, offers versions 1 + draft-32
-- QUIC Retry (20%) — asks prober to retry with a token
-- QUIC Connection Close (20%) — reports PROTOCOL_VIOLATION
+When receiving invalid probe packets, server responds with realistic QUIC packets derived from probe entropy (0.0x amplification on small UDP probes, Version Negotiation, Retry, Connection Close).
 
-**Effect:** Active scanners conclude this is an ordinary QUIC server and de-list the IP.
-Rate-limited to 5 responses/sec per source IP.
-
-Module: `blackhole_responder.h/cpp`
-
-### 8.5 Summary Table
-| Property | How achieved |
-|---|---|
-| Defeats DPI state machines | Illusion pre-bypass (fake STUN/QUIC before handshake) |
-| Defeats ML classifiers | Bimodal semantic padding (YouTube-like distribution) |
-| Defeats timing analysis | Active chaffing (constant packet flow during idle) |
-| Defeats active probing | Cryptographic blackhole (varied QUIC responses) |
-| No static byte signature | VER_MAGIC always masked; first 12 bytes are random IV |
-| Looks like random UDP | All observable bytes are pseudorandom |
-| Variable length | Semantic padding + random junk per packet |
-| No timing pattern | Chaff engine + epoll-based, no sleep() in hot path |
-
-## 11. Port Hopping (Active DPI Evasion)
-
-AEGS v4 rotates the active UDP port every `hop_interval` seconds using HMAC-SHA256:
-
+## 9. Port Hopping (Active Transport Evasion)
+AEGS v4 rotates active UDP ports every `hop_interval` seconds using HMAC-SHA256:
 ```
 epoch = floor(time() / hop_interval)
 hmac = HMAC-SHA256(session_key, epoch_be64)
 port = base_port + (le32(hmac[0:4]) % port_count)
 ```
+- **Deployment Note:** Default deployment keeps `port_count` small (e.g. 5 ports, 50001-50005) or utilizes dynamic single-port redirection via kernel iptables / eBPF to prevent automated port-scan detection from flagging large contiguous blocks of open UDP ports on a single host.
 
-**Properties:**
-- Server binds all ports simultaneously (base_port to base_port + count - 1)
-- Client deterministically predicts the active port
-- Different sessions hop on different schedules (key-dependent)
-- Boundary window: client tries both current and next epoch port during transitions
-
-**Wire format unchanged** — port hopping is purely at the transport layer.
-
-## 12. Session Resumption (Zero-RTT Reconnect)
-
+## 10. Session Resumption (Zero-RTT Reconnect)
 After successful ECDH handshake, server issues a **ResumptionToken** (96 bytes):
+- Nonce (12 B), Encrypted Session State (52 B), Poly1305 Tag (16 B), Reserved (16 B)
+- Client resumes with `0x04 || token`, server verifies and restores keys in <5ms without full ECDH recalculation.
 
-| Field | Size | Description |
-|-------|------|-------------|
-| nonce | 32 B | Random nonce |
-| ciphertext | 32 B | Encrypted: session_id(8) + ip(4) + expiry_ms(8) + zeros(12) |
-| tag | 16 B | Poly1305 AEAD tag |
-| reserved | 16 B | Zero-padded, future use |
+## 11. Network Security & Reliability Suite
 
-**Encryption:** ChaCha20-Poly1305, key derived via HKDF(master_key, "aegs-v4-resumption-key")
+### 11.1 Hardware Kill-Switch Isolation
+Strict firewall isolation (`iptables` on Linux, WinFilter on Windows) ensures zero packet leaks if the tunnel drops:
+- Dedicated chain `AEGS_KILLSWITCH` drops all traffic on physical interfaces except tunnel, loopback, DHCP, and VPN server port range.
 
-**Protocol flow:**
-1. Client sends `RESUME` packet: `0x04 || token[96]` (97 bytes)
-2. Server verifies token, restores session state
-3. Server issues new token for next reconnect
-4. Reconnect completes in <5ms (vs ~1s full handshake)
+### 11.2 DNS Leak Protection Shield
+Blocks all unencrypted port 53 traffic across external physical adapters, enforcing exclusive resolution through internal tunnel DNS (`10.8.0.1`).
 
-**Security:**
-- Anti-replay: server tracks used nonces
-- Expiry: 3-minute TTL
-- AEAD authentication prevents forgery
+### 11.3 Transport Failure Detection (Advisory Monitor)
+`TransportFailureDetector` continuously monitors transport health:
+- Tracks consecutive timeout counts, sustained blackouts, and packet loss (>75%).
+- **Current Status:** Currently implemented as an **in-memory advisory detector & telemetry logger** (`should_fallback_to_tcp() -> bool`). It raises structured alerts for client orchestrators to prompt fallback, rather than an automatic in-engine socket migration to TCP/TLS 1.3.
 
-## 13. Security Considerations
+## 12. Security Considerations
 - Token brute-force: 200,000 PBKDF2 iterations (~1s on modern CPU)
 - DoS: rate limiter (5 responses/sec per IP), IP banning after 10 weight points
-- Replay: RFC 6479 64-bit window
+- Replay: RFC 6479 2048-packet sliding window
 - Forward secrecy: ephemeral X25519 per session
-- Memory safety: ASan/UBSan verified, zero heap allocs in hot path
-- Chaff MAC verification: chaff packets are fully authenticated before dropping
+- Header authentication: Outer header authenticated via Poly1305 AAD
 
-## 10. Comparison with Related Protocols
+## 13. Comparison with Related Protocols
 | Feature | WireGuard | AmneziaWG 3.1 | XTLS-Reality | AEGS v4 Pantheon |
 |---|---|---|---|---|
 | Static handshake signature | Yes | Masked | N/A (TCP) | Masked + Illusion decoys |
@@ -225,31 +176,3 @@ After successful ECDH handshake, server issues a **ResumptionToken** (96 bytes):
 | Active probe resistance | None | DNS FORMERR | TLS camouflage | QUIC blackhole (3 strategies) |
 | Forward secrecy | Yes | Yes | Yes | Yes (X25519 per session) |
 | Protocol | UDP | UDP | TCP | UDP |
-
-## 13. Network Security & Reliability Suite
-
-AEGS v4 integrates dedicated hardware/firewall level leak prevention:
-
-### 13.1 Hardware Kill-Switch Isolation
-When enabled (`--kill-switch` or `AEGS_KILL_SWITCH=1`), strict firewall filtering rules are engaged:
-- **Dedicated Chain (`AEGS_KILLSWITCH`):**
-  1. Permits established and related traffic (`ESTABLISHED,RELATED`).
-  2. Permits loopback traffic (`lo` / `127.0.0.1`).
-  3. Permits all traffic routed through the VPN tunnel (`aegs0`).
-  4. Permits local DHCP client renewal (UDP 67/68).
-  5. Permits direct traffic to the VPN server IP strictly on the active port hopping range (`base_port:base_port+port_count-1`).
-  6. **DROPS** all other outgoing traffic across physical interfaces.
-- **RAII Lifecycle:** All rules are automatically restored on clean client exit, and signal traps handle unexpected interruptions.
-
-### 13.2 DNS Leak Protection Shield
-When enabled (`--dns-protect` or `AEGS_DNS_PROTECT=1`):
-- **Port 53 Lockdown:** Blocks all unencrypted UDP and TCP port 53 packets directed at external physical network adapters.
-- **Resolver Enforcement:** Directs all domain resolution exclusively through the internal tunnel DNS (`10.8.0.1` or configured DNS) via `/etc/resolv.conf` backup and atomic restoration.
-
-### 13.3 Transport Failure Detection & Multi-Transport Fallback
-`TransportFailureDetector` continuously monitors transport health:
-- Tracks consecutive timeout counts and sustained blackout duration.
-- Identifies severe packet suppression (>75% sustained drop across 100+ packets).
-- Triggers automatic TCP/TLS 1.3 fallback recommendations when UDP is censored or throttled.
-
-

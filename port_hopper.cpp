@@ -101,3 +101,17 @@ PortHopper::port_window(const uint8_t session_key[32]) const noexcept {
     return {epoch_to_port(session_key, epoch),
             epoch_to_port(session_key, epoch + 1)};
 }
+
+// ---------------------------------------------------------------------------
+// Server side: validate incoming packet port against hopping window
+// ---------------------------------------------------------------------------
+bool PortHopper::is_valid_port(const uint8_t session_key[32], uint16_t received_port) const noexcept {
+    if (count_ <= 1) return received_port == base_port_;
+    uint64_t epoch = static_cast<uint64_t>(
+        static_cast<uint64_t>(std::time(nullptr)) / hop_interval_sec_);
+    if (epoch_to_port(session_key, epoch) == received_port) return true;
+    if (epoch > 0 && epoch_to_port(session_key, epoch - 1) == received_port) return true;
+    if (epoch_to_port(session_key, epoch + 1) == received_port) return true;
+    return false;
+}
+

@@ -158,27 +158,45 @@ def semantic_pad(payload_len: int) -> int:
 
 def send_illusion_sequence(sock: socket.socket, server_addr: tuple[str, int]):
     """AEGS v4 State-Machine Pre-Bypass: sends 1-3 STUN / QUIC Initial decoys."""
+    import zlib
     count = 1 + secrets.randbelow(3)
     for _ in range(count):
         if secrets.randbelow(2) == 0:
-            # RFC 5389 STUN Binding Request decoy
-            pkt = bytearray(20)
-            pkt[0:2] = b"\x00\x01"
+            # RFC 5389 STUN Binding Request decoy with USERNAME and FINGERPRINT
+            pkt = bytearray(40)
+            pkt[0:2] = b"\x00\x01" # Binding Request
+            pkt[2:4] = b"\x00\x14" # 20 bytes attribute length
             pkt[4:8] = b"\x21\x12\xA4\x42" # Magic Cookie
             pkt[8:20] = secrets.token_bytes(12)
+            # USERNAME (0x0006), len 8
+            pkt[20:22] = b"\x00\x06"
+            pkt[22:24] = b"\x00\x08"
+            pkt[24:32] = secrets.token_bytes(8)
+            # FINGERPRINT (0x8028), len 4
+            pkt[32:34] = b"\x80\x28"
+            pkt[34:36] = b"\x00\x04"
+            crc = zlib.crc32(pkt[:32]) & 0xFFFFFFFF
+            fp = crc ^ 0x5354554E
+            pkt[36:40] = struct.pack(">I", fp)
         else:
-            # RFC 9000 QUIC Initial decoy (>=1200 bytes)
+            # RFC 9000 QUIC Initial decoy (>=1200 bytes, exact varint 0x4496)
             pkt = bytearray(1200)
             pkt[0] = 0xC3 # Long header Initial
             pkt[1:5] = b"\x00\x00\x00\x01" # QUIC v1
             pkt[5] = 8; pkt[6:14] = secrets.token_bytes(8)
             pkt[14] = 8; pkt[15:23] = secrets.token_bytes(8)
-            pkt[24:26] = b"\x44\x92"
+            pkt[24:26] = b"\x44\x96" # Length varint: 1174 bytes
             pkt[26:30] = secrets.token_bytes(4)
             pkt[30:1200] = secrets.token_bytes(1170)
         try:
             sock.sendto(bytes(pkt), server_addr)
-            time.sleep(0.01 + secrets.randbelow(40) / 1000.0)
+            # Non-blocking check for response to simulate complete RTT for stateful DPI
+            r, _, _ = select.select([sock], [], [], 0.025 + secrets.randbelow(35) / 1000.0)
+            if r:
+                try:
+                    sock.recvfrom(2048)
+                except OSError:
+                    pass
         except OSError:
             pass
 
@@ -366,13 +384,14 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
                     chaff_frame = b"\x00\x00" + secrets.token_bytes(chaff_pad)
                     client_tx_seq += 1
                     chaff_nonce = struct.pack("<Q", client_tx_seq) + secrets.token_bytes(4)
-                    chaff_ct = aead.encrypt(chaff_nonce, chaff_frame, None)
                     chaff_hdr = bytearray(16)
                     chaff_hdr[0:8] = raw_kid
                     chaff_hdr[10] = 0x80 # CHAFF flag (silent drop on server)
                     chaff_hdr[12:16] = VER_MAGIC
                     chaff_iv = secrets.token_bytes(12)
                     chaff_masked = mask_unmask_header(bytes(chaff_hdr), mask_key, chaff_iv)
+                    chaff_aad = chaff_iv + chaff_masked
+                    chaff_ct = aead.encrypt(chaff_nonce, chaff_frame, chaff_aad)
                     try:
                         cur_port = compute_hopper_port(payload_key, DEFAULT_SERVER_PORT, port_count, hop_interval)
                         sock.sendto(chaff_iv + chaff_masked + chaff_nonce + chaff_ct, (server_ip, cur_port))
@@ -413,7 +432,8 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
 
                 ct = data[aead_offset + 12 :]
                 try:
-                    pt = aead.decrypt(aead_nonce, ct, None)
+                    # FIX Blocker 3: Authenticate outer header data[:aead_offset] as AAD
+                    pt = aead.decrypt(aead_nonce, ct, data[:aead_offset])
                 except Exception:
                     continue
 
@@ -437,7 +457,6 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
 
                 client_tx_seq += 1
                 aead_nonce = struct.pack("<Q", client_tx_seq) + secrets.token_bytes(4)
-                ct = aead.encrypt(aead_nonce, frame, None)
 
                 # 20% chance of junk insertion
                 junk_len = 16 + secrets.randbelow(49) if secrets.randbelow(100) < 20 else 0
@@ -446,11 +465,16 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
                 hdr_iv = secrets.token_bytes(12)
                 masked_hdr = mask_unmask_header(hdr_plain, mask_key, hdr_iv)
 
-                out_pkt = bytearray()
-                out_pkt.extend(hdr_iv)
-                out_pkt.extend(masked_hdr)
+                out_hdr = bytearray()
+                out_hdr.extend(hdr_iv)
+                out_hdr.extend(masked_hdr)
                 if junk_len > 0:
-                    out_pkt.extend(secrets.token_bytes(junk_len))
+                    out_hdr.extend(secrets.token_bytes(junk_len))
+
+                # FIX Blocker 3: Authenticate outer header as AAD in AEAD Poly1305
+                ct = aead.encrypt(aead_nonce, frame, bytes(out_hdr))
+
+                out_pkt = bytearray(out_hdr)
                 out_pkt.extend(aead_nonce)
                 out_pkt.extend(ct)
 

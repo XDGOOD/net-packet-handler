@@ -4,6 +4,7 @@
 #include <openssl/rand.h>
 #include <openssl/err.h>
 #include <openssl/hmac.h>
+#include <openssl/crypto.h>
 #include <cstring>
 #include <chrono>
 #include <fstream>
@@ -141,10 +142,10 @@ std::vector<uint8_t> HandshakeClient::build_init() {
     return packet;
 }
 
-// FIX CRIT-3: Full AEAD decryption with Poly1305 tag verification.
-// Previously, EVP_DecryptFinal_ex was never called and the tag was never
-// set/verified — making this plain ChaCha20 stream cipher, not AEAD.
-// A MITM could have modified EncryptedConfig (AssignedIP, MTU) in transit.
+// FIX Issue 3.1: Server response mutual authentication with MasterKey & AAD transcript.
+// Verifies that HANDSHAKE_RESP was produced by the legitimate server holding MasterKey.
+// Derives session keys using m_master_key as salt in HKDF, and passes bytes 0..47
+// (Type, Reserved, SessionID, ServerEphemeralPublicKey) as AAD to ChaCha20-Poly1305.
 bool HandshakeClient::process_resp(const uint8_t* resp, size_t len, SessionKeys& out) {
     // Response is now 80 bytes: 48 header + 16 ciphertext + 16 AEAD tag
     if (len < 80 || resp[0] != 0x02) return false;
@@ -158,17 +159,29 @@ bool HandshakeClient::process_resp(const uint8_t* resp, size_t len, SessionKeys&
     EVP_PKEY_free(server_ephemeral);
     if (shared_secret.empty()) return false;
 
-    hkdf_sha256(shared_secret, m_key_id, 8, "aegs-c2s", out.send_key, 32);
-    hkdf_sha256(shared_secret, m_key_id, 8, "aegs-s2c", out.recv_key, 32);
+    // FIX Issue 3.1: Derive session keys using m_master_key (per-user secret) as salt
+    // instead of public m_key_id. This ensures mutual authentication: an active MITM
+    // without MasterKey cannot derive the correct keys or generate a valid AEAD tag.
+    hkdf_sha256(shared_secret, m_master_key, 32, "aegs-c2s", out.send_key, 32);
+    hkdf_sha256(shared_secret, m_master_key, 32, "aegs-s2c", out.recv_key, 32);
 
-    // Decrypt config with full AEAD tag verification
+    // FIX Issue 12: Derive dedicated config_key for decrypting handshake response config.
+    // Domain separation prevents ChaCha20-Poly1305 nonce reuse (nonce=0) with S2C data plane.
+    uint8_t config_key[32];
+    hkdf_sha256(shared_secret, m_master_key, 32, "aegs-cfg", config_key, 32);
+
+    // Decrypt config with full AEAD tag verification, passing bytes 0..47 as AAD
+    // to bind the entire handshake response transcript (type, session_id, server_epk)
+    // to the Poly1305 authentication tag.
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) return false;
     uint8_t nonce[12] = {0};
     int outlen = 0, final_len = 0;
+    int unused = 0;
     uint8_t dec[16];
 
-    if (EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, out.recv_key, nonce) != 1 ||
+    if (EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, config_key, nonce) != 1 ||
+        EVP_DecryptUpdate(ctx, NULL, &unused, resp, 48) != 1 ||
         EVP_DecryptUpdate(ctx, dec, &outlen, &resp[48], 16) != 1 ||
         // Set the expected AEAD tag (bytes 64..79 of response)
         EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16,
@@ -273,7 +286,7 @@ bool HandshakeServer::process_init(const uint8_t* init, size_t len, uint64_t& ke
     auto mk_it = m_master_keys.find(key_id_out);
     if (mk_it == m_master_keys.end()) return false; // Unknown KeyID
     auto mac = compute_mac(init, 56, mk_it->second.data(), mk_it->second.size());
-    if (memcmp(mac.data(), &init[56], 16) != 0) return false;
+    if (CRYPTO_memcmp(mac.data(), &init[56], 16) != 0) return false;
 
     uint64_t ts;
     memcpy(&ts, &init[48], 8);
@@ -291,19 +304,17 @@ bool HandshakeServer::process_init(const uint8_t* init, size_t len, uint64_t& ke
     // FIX CRIT-5: Hard upper bounds on pre-auth state size.
     // If under sustained attack, we sacrifice new legitimate handshakes
     // rather than allowing OOM — this is the correct trade-off per §1.
-    if (m_seen_timestamps.size() >= MAX_SEEN_TIMESTAMPS) {
-        std::cerr << "[HS] WARNING: seen_timestamps at capacity ("
-                  << MAX_SEEN_TIMESTAMPS << "), rejecting handshake\n";
-        return false;
-    }
-    if (m_pending_clients.size() >= MAX_PENDING_CLIENTS) {
-        std::cerr << "[HS] WARNING: pending_clients at capacity ("
-                  << MAX_PENDING_CLIENTS << "), rejecting handshake\n";
-        return false;
-    }
+    if (m_pending_clients.size() >= MAX_PENDING_CLIENTS) return false;
+    if (m_seen_timestamps.size() >= MAX_SEEN_TIMESTAMPS) return false;
 
-    if (m_seen_timestamps.count(ts)) return false;
+    if (m_seen_timestamps.find(ts) != m_seen_timestamps.end()) return false;
     m_seen_timestamps.insert(ts);
+
+    // Free any stale ephemeral key from a previous abandoned handshake for this key_id
+    auto existing = m_pending_clients.find(key_id_out);
+    if (existing != m_pending_clients.end() && existing->second.client_ephemeral_pkey) {
+        EVP_PKEY_free(existing->second.client_ephemeral_pkey);
+    }
 
     EVP_PKEY* client_pub = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, &init[16], 32);
     if (!client_pub) return false; // FIX MED-6: check for failure
@@ -312,17 +323,24 @@ bool HandshakeServer::process_init(const uint8_t* init, size_t len, uint64_t& ke
     return true;
 }
 
-// FIX CRIT-3: Full AEAD encryption of config with Poly1305 tag.
-// Previously, EVP_EncryptFinal_ex was never called and the tag was never
-// extracted — the ciphertext was unauthenticated. A MITM could modify
-// the assigned IP/MTU without detection.
-// Response is now 80 bytes (was 64): header(48) + ciphertext(16) + tag(16).
+// FIX Issue 3.1: Full AEAD encryption of config with Poly1305 tag and MasterKey binding.
+// Server derives session keys using the client's MasterKey as salt in HKDF, and
+// authenticates the response header (bytes 0..47) via AEAD AAD.
+// Response is 80 bytes: header(48) + ciphertext(16) + tag(16).
 std::vector<uint8_t> HandshakeServer::build_resp(uint64_t key_id, uint32_t assigned_ip, uint16_t mtu, SessionKeys& out) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_pending_clients.find(key_id) == m_pending_clients.end()) return {};
     
     ClientState state = m_pending_clients[key_id];
     m_pending_clients.erase(key_id);
+
+    auto mk_it = m_master_keys.find(key_id);
+    if (mk_it == m_master_keys.end()) {
+        EVP_PKEY_free(state.client_ephemeral_pkey);
+        return {};
+    }
+    const uint8_t* master_key = mk_it->second.data();
+    size_t master_key_len = mk_it->second.size();
 
     EVP_PKEY* server_ephemeral = generate_x25519();
     if (!server_ephemeral) {
@@ -336,11 +354,15 @@ std::vector<uint8_t> HandshakeServer::build_resp(uint64_t key_id, uint32_t assig
         return {};
     }
 
-    uint8_t key_id_bytes[8];
-    memcpy(key_id_bytes, &key_id, 8);
+    // FIX Issue 3.1: Derive session keys using MasterKey as salt in HKDF
+    // instead of public key_id.
+    hkdf_sha256(shared_secret, master_key, master_key_len, "aegs-c2s", out.recv_key, 32);
+    hkdf_sha256(shared_secret, master_key, master_key_len, "aegs-s2c", out.send_key, 32);
 
-    hkdf_sha256(shared_secret, key_id_bytes, 8, "aegs-c2s", out.recv_key, 32);
-    hkdf_sha256(shared_secret, key_id_bytes, 8, "aegs-s2c", out.send_key, 32);
+    // FIX Issue 12: Derive dedicated config_key for encrypting handshake response config.
+    // Domain separation prevents ChaCha20-Poly1305 nonce reuse (nonce=0) with S2C data plane.
+    uint8_t config_key[32];
+    hkdf_sha256(shared_secret, master_key, master_key_len, "aegs-cfg", config_key, 32);
 
     RAND_bytes((uint8_t*)&out.session_id, 8);
     out.assigned_ip = assigned_ip;
@@ -357,7 +379,10 @@ std::vector<uint8_t> HandshakeServer::build_resp(uint64_t key_id, uint32_t assig
     if (pub.empty()) return {};
     memcpy(&resp[16], pub.data(), 32);
 
-    // Encrypt config with full AEAD (EncryptUpdate + EncryptFinal + GET_TAG)
+    // Encrypt config with full AEAD (EncryptUpdate + EncryptFinal + GET_TAG).
+    // Associated Data (AAD) includes the 48-byte transcript header (type, reserved,
+    // session_id, server_ephemeral_pub) so any tampering with the server ephemeral
+    // key or session ID causes AEAD tag verification failure.
     uint8_t plain_config[16] = {0};
     plain_config[0] = assigned_ip & 0xFF;
     plain_config[1] = (assigned_ip >> 8) & 0xFF;
@@ -370,8 +395,10 @@ std::vector<uint8_t> HandshakeServer::build_resp(uint64_t key_id, uint32_t assig
     if (!ctx) return {};
     uint8_t nonce[12] = {0};
     int outlen = 0, final_len = 0;
+    int unused = 0;
 
-    if (EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, out.send_key, nonce) != 1 ||
+    if (EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, config_key, nonce) != 1 ||
+        EVP_EncryptUpdate(ctx, NULL, &unused, resp.data(), 48) != 1 ||
         EVP_EncryptUpdate(ctx, &resp[48], &outlen, plain_config, 16) != 1 ||
         EVP_EncryptFinal_ex(ctx, &resp[48 + outlen], &final_len) != 1) {
         EVP_CIPHER_CTX_free(ctx);

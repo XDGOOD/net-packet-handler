@@ -42,6 +42,9 @@ public:
     // Thread-safe: uses thread_local PRNG.
     size_t semantic_pad(size_t actual_payload_len) noexcept;
 
+    // Fast fill padding bytes inside AEAD using thread_local PRNG (zero syscalls)
+    static void fill_random_padding(uint8_t* dest, size_t len) noexcept;
+
     // --- Accessors ---
     bool enabled()              const noexcept { return enabled_; }
     void set_enabled(bool e)          noexcept { enabled_ = e; }

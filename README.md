@@ -3,7 +3,7 @@
 [![Tests](https://img.shields.io/badge/Tests-12%2F12%20Pillars%20PASS-brightgreen.svg)](#)
 [![Language](https://img.shields.io/badge/Language-C%2B%2B17-blue.svg)](#)
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)](#)
-[![Version](https://img.shields.io/badge/Version-4.0%20Pantheon-orange.svg)](#)
+[![Version](https://img.shields.io/badge/Version-V4.12%20Pantheon-orange.svg)](#)
 
 > **State-of-the-Art, High-Performance, AI/ML & State-Machine Resistant UDP Tunnel Protocol**
 

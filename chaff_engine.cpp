@@ -1,4 +1,5 @@
 #include "chaff_engine.h"
+#include "traffic_shaper.h"
 #include <random>
 #include <openssl/rand.h>
 #include <openssl/evp.h>
@@ -11,14 +12,29 @@ extern bool mask_unmask_header(const uint8_t* in, size_t len, const uint8_t* mas
 extern bool chacha20_poly1305_encrypt(const uint8_t* pt, size_t pt_len, const uint8_t* key, const uint8_t* nonce, uint8_t* ct, size_t& ct_len);
 static const std::string CHAFF_VER_MAGIC = "AG2\x01";
 
+namespace {
+inline std::mt19937& chaff_rng() noexcept {
+    thread_local std::mt19937 rng{
+        []() -> uint32_t {
+            std::random_device rd;
+            uint32_t seed = rd();
+            auto tp = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+            seed ^= static_cast<uint32_t>(tp & 0xFFFFFFFFu);
+            seed ^= static_cast<uint32_t>(tp >> 32);
+            return seed;
+        }()
+    };
+    return rng;
+}
+} // anonymous namespace
+
 ChaffEngine::ChaffEngine(int idle_threshold_ms, int min_interval_ms, int max_interval_ms)
     : idle_threshold_ms_(idle_threshold_ms), min_interval_ms_(min_interval_ms), max_interval_ms_(max_interval_ms) {
     mark_real_packet();
 }
 
 void ChaffEngine::schedule_next_chaff() {
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    auto& gen = chaff_rng();
     std::uniform_int_distribution<> dist(min_interval_ms_, max_interval_ms_);
     next_chaff_time_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(dist(gen));
 }
@@ -39,15 +55,19 @@ bool ChaffEngine::should_send_chaff() {
     return false;
 }
 
-std::vector<uint8_t> ChaffEngine::build_chaff_packet(const uint8_t* raw_kid, const uint8_t* mask_key, const uint8_t* send_key, uint64_t& tx_seq) {
-    // Generate chaff payload (2 bytes zero len + padding)
-    std::random_device rd;
-    std::mt19937 gen(rd());
+std::vector<uint8_t> ChaffEngine::generate_dummy_payload() {
+    auto& gen = chaff_rng();
     std::uniform_int_distribution<> pad_dist(64, 128);
     int pad_len = pad_dist(gen);
-    
-    std::vector<uint8_t> pbuf(2 + pad_len, 0); 
-    RAND_bytes(pbuf.data() + 2, pad_len);
+
+    std::vector<uint8_t> pbuf(2 + pad_len, 0);
+    TrafficShaper::fill_random_padding(pbuf.data() + 2, pad_len);
+    return pbuf;
+}
+
+std::vector<uint8_t> ChaffEngine::build_chaff_packet(const uint8_t* raw_kid, const uint8_t* mask_key, const uint8_t* send_key, uint64_t& tx_seq) {
+    // Generate chaff payload (2 bytes zero len + padding)
+    std::vector<uint8_t> pbuf = generate_dummy_payload();
     
     // Encrypt
     uint8_t aead_nonce[12] = {0};

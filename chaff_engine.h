@@ -10,6 +10,7 @@ public:
     bool should_send_chaff();
     void mark_real_packet();
     
+    std::vector<uint8_t> generate_dummy_payload();
     std::vector<uint8_t> build_chaff_packet(const uint8_t* raw_kid, const uint8_t* mask_key, const uint8_t* send_key, uint64_t& tx_seq);
 
 private:

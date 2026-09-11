@@ -1,5 +1,10 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <iostream>
 #include <string>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 #include <queue>
@@ -13,6 +18,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <signal.h>
 #include <sqlite3.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
@@ -21,6 +27,8 @@
 #include <chrono>
 #include <thread>
 #include <mutex>
+#include <atomic>
+#include <algorithm>
 
 #include "tun_interface.h"
 #include "ip_router.h"
@@ -33,6 +41,11 @@
 #include "session_resumption.h"
 #include "session_table.h"
 #include "aegs_config.h"
+#include "network_security.h"
+
+#ifndef SO_REUSEPORT
+#define SO_REUSEPORT 15
+#endif
 
 // --- AEGS Protocol v2 Constants ---
 // AWG v1/v2/v3 Obfuscation & Noise Architecture + VLESS-REALITY Mimicry
@@ -73,107 +86,153 @@ bool hkdf_expand(const uint8_t* master_key, size_t master_key_len, const std::st
     return true;
 }
 
+// RAII thread_local EVP_CIPHER_CTX holder to guarantee zero heap allocations on the packet hot path
+struct ThreadLocalCipherCtx {
+    EVP_CIPHER_CTX* ctx = nullptr;
+
+    ThreadLocalCipherCtx() noexcept {
+        ctx = EVP_CIPHER_CTX_new();
+    }
+
+    ~ThreadLocalCipherCtx() {
+        if (ctx) {
+            EVP_CIPHER_CTX_free(ctx);
+            ctx = nullptr;
+        }
+    }
+
+    ThreadLocalCipherCtx(const ThreadLocalCipherCtx&) = delete;
+    ThreadLocalCipherCtx& operator=(const ThreadLocalCipherCtx&) = delete;
+};
+
 // AWG v3 Dynamic Header Masking (ChaCha20 Stream Cipher)
 bool mask_unmask_header(const uint8_t* in, size_t len, const uint8_t* mask_key, const uint8_t* hdr_iv, uint8_t* out) {
     uint8_t full_iv[16] = {0};
     std::memcpy(full_iv + 4, hdr_iv, 12);
 
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    thread_local ThreadLocalCipherCtx tl_ctx;
+    EVP_CIPHER_CTX* ctx = tl_ctx.ctx;
     if (!ctx) return false;
+    EVP_CIPHER_CTX_reset(ctx);
+
     int outlen = 0;
     if (EVP_CipherInit_ex(ctx, EVP_chacha20(), NULL, mask_key, full_iv, 1) != 1 ||
         EVP_CipherUpdate(ctx, out, &outlen, in, (int)len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
+        EVP_CIPHER_CTX_reset(ctx);
         return false;
     }
     int final_len = 0;
     EVP_CipherFinal_ex(ctx, out + outlen, &final_len);
-    EVP_CIPHER_CTX_free(ctx);
+    EVP_CIPHER_CTX_reset(ctx);
     return true;
 }
 
-bool chacha20_poly1305_encrypt(const uint8_t* pt, size_t pt_len, const uint8_t* key, const uint8_t* nonce, uint8_t* ct, size_t& ct_len) {
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+bool chacha20_poly1305_encrypt(const uint8_t* pt, size_t pt_len, const uint8_t* key, const uint8_t* nonce, uint8_t* ct, size_t& ct_len, const uint8_t* aad = nullptr, size_t aad_len = 0) {
+    thread_local ThreadLocalCipherCtx tl_ctx;
+    EVP_CIPHER_CTX* ctx = tl_ctx.ctx;
     if (!ctx) return false;
+    EVP_CIPHER_CTX_reset(ctx);
+
     if (EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) != 1 ||
         EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) != 1 ||
         EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) {
-        EVP_CIPHER_CTX_free(ctx); return false;
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
     }
-    int len;
-    if (EVP_EncryptUpdate(ctx, ct, &len, pt, (int)pt_len) != 1) { EVP_CIPHER_CTX_free(ctx); return false; }
+    int len = 0;
+    if (aad && aad_len > 0) {
+        if (EVP_EncryptUpdate(ctx, NULL, &len, aad, (int)aad_len) != 1) {
+            EVP_CIPHER_CTX_reset(ctx);
+            return false;
+        }
+    }
+    if (EVP_EncryptUpdate(ctx, ct, &len, pt, (int)pt_len) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
     int total_len = len;
-    if (EVP_EncryptFinal_ex(ctx, ct + len, &len) != 1) { EVP_CIPHER_CTX_free(ctx); return false; }
+    if (EVP_EncryptFinal_ex(ctx, ct + len, &len) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
     total_len += len;
     uint8_t tag[16];
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag) != 1) { EVP_CIPHER_CTX_free(ctx); return false; }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
     std::memcpy(ct + total_len, tag, 16);
     ct_len = total_len + 16;
-    EVP_CIPHER_CTX_free(ctx); return true;
+    EVP_CIPHER_CTX_reset(ctx);
+    return true;
 }
 
-bool chacha20_poly1305_decrypt(const uint8_t* ct, size_t ct_len, const uint8_t* key, const uint8_t* nonce, uint8_t* pt, size_t& pt_len) {
+bool chacha20_poly1305_decrypt(const uint8_t* ct, size_t ct_len, const uint8_t* key, const uint8_t* nonce, uint8_t* pt, size_t& pt_len, const uint8_t* aad = nullptr, size_t aad_len = 0) {
     if (ct_len < 16) return false;
-    size_t c_len = ct_len - 16; const uint8_t* tag = ct + c_len;
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    size_t c_len = ct_len - 16;
+    const uint8_t* tag = ct + c_len;
+
+    thread_local ThreadLocalCipherCtx tl_ctx;
+    EVP_CIPHER_CTX* ctx = tl_ctx.ctx;
     if (!ctx) return false;
+    EVP_CIPHER_CTX_reset(ctx);
+
     if (EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) != 1 ||
         EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) != 1 ||
         EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) {
-        EVP_CIPHER_CTX_free(ctx); return false;
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
     }
-    int len;
-    if (EVP_DecryptUpdate(ctx, pt, &len, ct, (int)c_len) != 1) { EVP_CIPHER_CTX_free(ctx); return false; }
+    int len = 0;
+    if (aad && aad_len > 0) {
+        if (EVP_DecryptUpdate(ctx, NULL, &len, aad, (int)aad_len) != 1) {
+            EVP_CIPHER_CTX_reset(ctx);
+            return false;
+        }
+    }
+    if (EVP_DecryptUpdate(ctx, pt, &len, ct, (int)c_len) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
     int total_len = len;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, const_cast<uint8_t*>(tag)) != 1) { EVP_CIPHER_CTX_free(ctx); return false; }
-    if (EVP_DecryptFinal_ex(ctx, pt + len, &len) <= 0) { EVP_CIPHER_CTX_free(ctx); return false; }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, const_cast<uint8_t*>(tag)) != 1) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
+    if (EVP_DecryptFinal_ex(ctx, pt + len, &len) <= 0) {
+        EVP_CIPHER_CTX_reset(ctx);
+        return false;
+    }
     total_len += len;
     pt_len = total_len;
-    EVP_CIPHER_CTX_free(ctx); return true;
+    EVP_CIPHER_CTX_reset(ctx);
+    return true;
 }
 
-// RFC 6479 / Linux WireGuard 64-bit Sliding Window Anti-Replay Filter
-class AntiReplayFilter {
-    uint64_t last_seq = 0;
-    uint64_t bitmap = 0;
-public:
-    bool check_and_update(uint64_t seq) {
-        if (seq == 0) return true; // Replay/Invalid
-        if (seq > last_seq) {
-            uint64_t diff = seq - last_seq;
-            if (diff < 64) {
-                bitmap = (bitmap << diff) | 1ULL;
-            } else {
-                bitmap = 1ULL;
-            }
-            last_seq = seq;
-            return false; // Valid and updated
-        }
-        uint64_t diff = last_seq - seq;
-        if (diff >= 64) return true; // Out of sliding window (too old) -> reject
-        if (bitmap & (1ULL << diff)) return true; // Already seen -> replay detected
-        bitmap |= (1ULL << diff);
-        return false; // Valid out-of-order packet accepted
-    }
-};
 
 struct Session {
     std::string key_id_hex;
+    uint64_t key_id_raw = 0;
     uint8_t master_key[32];
     uint8_t mask_key[32];
-    uint8_t payload_key[32];
     struct sockaddr_in client_addr {};
     bool has_client = false;
     double last_activity = 0;
-    uint64_t tx_seq = 0;
+    std::atomic<uint64_t> tx_seq{0};
     AntiReplayFilter replay_filter;
     uint64_t session_id = 0;     // NEW: AEGS v3 session ID from handshake
     uint32_t assigned_ip = 0;    // NEW: assigned TUN IP (host byte order)
     SessionKeys session_keys;    // NEW: ECDH-derived per-session keys
     bool v3_handshake_done = false; // NEW: true after ECDH handshake complete
     int last_server_fd = -1;
+    mutable std::mutex mu;
+
+    Session() = default;
+    Session(const Session&) = delete;
+    Session& operator=(const Session&) = delete;
 
     bool check_replay(const uint8_t* n_bytes) {
+        std::lock_guard<std::mutex> lk(mu);
         uint64_t seq = 0;
         std::memcpy(&seq, n_bytes, sizeof(uint64_t));
         return replay_filter.check_and_update(seq);
@@ -184,24 +243,55 @@ std::unordered_map<std::string, Session*> sessions;
 std::unordered_map<uint32_t, Session*> ip_to_session;
 std::mutex sessions_mu;
 
+// Fast-path O(1) cache: maps 64-bit client endpoint (ip:port) to Session*
+std::unordered_map<uint64_t, Session*> g_endpoint_cache;
+std::mutex g_endpoint_mu;
+
+static inline uint64_t make_endpoint_key(uint32_t ip, uint16_t port) {
+    return (static_cast<uint64_t>(ip) << 16) | static_cast<uint64_t>(port);
+}
+
 struct FailRecord { 
     double weight = 0; 
     double last_seen = 0; 
     int level = 0; 
     double last_fallback_dns = 0; // Token bucket rate limiter for DNS mimicry
 };
-std::unordered_map<std::string, FailRecord> failed_attempts;
-std::unordered_map<std::string, double> banned_ips;
+std::unordered_map<uint32_t, FailRecord> failed_attempts;
+std::unordered_map<uint32_t, double> banned_ips;
 const int ban_levels[] = {0, 30, 300, 3600};
+std::mutex security_mu;
+std::mutex tun_write_mu;
+
+// Signal handling & clean shutdown
+static std::atomic<bool> g_running{true};
+static void handle_signal(int sig) {
+    (void)sig;
+    g_running = false;
+}
 
 double last_cleanup = 0;
 const double CLEANUP_INTERVAL = 30.0;
 const double FAIL_IDLE_TTL = 300.0;
 const double SESSION_IDLE_TIMEOUT = 180.0; // 3 minutes idle -> close inactive session
 
-void cleanup_maps(double now, int epoll_fd) {
+void cleanup_maps(double now, IpPool& ip_pool) {
+    if (now - last_cleanup < CLEANUP_INTERVAL) return;
+    std::lock_guard<std::mutex> sec_lock(security_mu);
+    std::lock_guard<std::mutex> sess_lock(sessions_mu);
     if (now - last_cleanup < CLEANUP_INTERVAL) return;
     last_cleanup = now;
+
+    {
+        std::lock_guard<std::mutex> ep_lock(g_endpoint_mu);
+        for (auto it = g_endpoint_cache.begin(); it != g_endpoint_cache.end(); ) {
+            if (!it->second->has_client || (now - it->second->last_activity > SESSION_IDLE_TIMEOUT)) {
+                it = g_endpoint_cache.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
 
     for (auto it = banned_ips.begin(); it != banned_ips.end(); ) {
         if (now > it->second) it = banned_ips.erase(it); else ++it;
@@ -211,9 +301,13 @@ void cleanup_maps(double now, int epoll_fd) {
     }
     for (auto it = sessions.begin(); it != sessions.end(); ) {
         Session* s = it->second;
+        std::lock_guard<std::mutex> slk(s->mu);
         if (s->has_client && (now - s->last_activity > SESSION_IDLE_TIMEOUT)) {
             std::cerr << "[GC] Session " << s->key_id_hex << " idle timeout\n";
-            if (s->assigned_ip) ip_to_session.erase(s->assigned_ip);
+            if (s->assigned_ip) {
+                ip_to_session.erase(s->assigned_ip);
+                ip_pool.release(s->assigned_ip);
+            }
             s->has_client = false;
             s->v3_handshake_done = false;
             s->assigned_ip = 0;
@@ -235,11 +329,16 @@ ResumptionManager g_resumption;
 // Blackhole-enhanced probing fallback: generates varied QUIC-like responses
 void send_probing_fallback(int fd, const struct sockaddr_in& caddr,
                            const uint8_t* probe_data, size_t probe_len,
-                           const std::string& ip, double now) {
+                           uint32_t ip_num, double now) {
+    (void)ip_num;
+    if (probe_len < BlackholeResponder::kMinProbeLen)
+        return; // Drop short probes to prevent UDP amplification reflection (Audit 4.4)
+    std::string ip = inet_ntoa(caddr.sin_addr);
     if (!g_blackhole.should_respond(ip, now))
         return;
     auto resp = g_blackhole.generate_response(probe_data, probe_len);
     if (!resp.empty()) {
+        g_blackhole.record_response(ip, resp.size());
         sendto(fd, resp.data(), resp.size(), 0,
                (struct sockaddr*)&caddr, sizeof(caddr));
     }
@@ -247,18 +346,19 @@ void send_probing_fallback(int fd, const struct sockaddr_in& caddr,
 
 void record_fail(int fd, const struct sockaddr_in& caddr,
                   const uint8_t* probe_data, size_t probe_len,
-                  const std::string& ip, double now, double weight) {
-    auto& rec = failed_attempts[ip];
+                  uint32_t ip_num, double now, double weight) {
+    std::lock_guard<std::mutex> lock(security_mu);
+    auto& rec = failed_attempts[ip_num];
     if (rec.level == 0) rec.level = 1;
     if (now - rec.last_seen > 120.0) { rec.weight = 0; }
     rec.last_seen = now;
     rec.weight += weight;
     
-    send_probing_fallback(fd, caddr, probe_data, probe_len, ip, now);
+    send_probing_fallback(fd, caddr, probe_data, probe_len, ip_num, now);
 
     if (rec.weight >= 10.0) {
         int lvl = std::min(rec.level, 3);
-        banned_ips[ip] = now + ban_levels[lvl];
+        banned_ips[ip_num] = now + ban_levels[lvl];
         rec.weight = 0; rec.level = lvl + 1;
     }
 }
@@ -277,7 +377,490 @@ uint16_t generate_junk_len() {
     return 0;
 }
 
+// Worker thread event loop
+void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
+                 const std::vector<uint16_t>& ports, TunInterface& tun,
+                 HandshakeServer& hs_server, IpPool& ip_pool, TrafficShaper& shaper) {
+    (void)worker_id;
+
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0) {
+        perror("epoll_create1");
+        return;
+    }
+
+    std::vector<int> server_fds;
+    std::unordered_set<int> server_fd_set;
+    std::unordered_map<int, uint16_t> fd_to_port;
+    PortHopper hopper(ports.empty() ? 50001 : ports.front(), ports.size(), 30);
+
+    for (uint16_t port : ports) {
+        int sfd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sfd < 0) { perror("socket"); return; }
+        if (!set_nonblocking(sfd)) { perror("fcntl"); close(sfd); return; }
+        int sock_buf_size = 4 * 1024 * 1024;
+        setsockopt(sfd, SOL_SOCKET, SO_RCVBUF, &sock_buf_size, sizeof(sock_buf_size));
+        setsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &sock_buf_size, sizeof(sock_buf_size));
+        int reuse = 1;
+        setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        if (num_workers > 1) {
+#ifdef SO_REUSEPORT
+            if (setsockopt(sfd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0) {
+                perror("setsockopt SO_REUSEPORT");
+            }
+#endif
+        }
+        struct sockaddr_in sa {};
+        sa.sin_family = AF_INET; sa.sin_addr.s_addr = INADDR_ANY; sa.sin_port = htons(port);
+        if (bind(sfd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+            perror("bind");
+            close(sfd);
+            return;
+        }
+        struct epoll_event ev_s {};
+        ev_s.events = EPOLLIN;
+        ev_s.data.fd = sfd;
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sfd, &ev_s) < 0) {
+            perror("epoll_ctl");
+            close(sfd);
+            return;
+        }
+        server_fds.push_back(sfd);
+        server_fd_set.insert(sfd);
+        fd_to_port[sfd] = port;
+    }
+
+    int tun_fd = tun.fd();
+    struct epoll_event ev_tun {};
+#ifdef EPOLLEXCLUSIVE
+    ev_tun.events = EPOLLIN | EPOLLEXCLUSIVE;
+#else
+    ev_tun.events = EPOLLIN;
+#endif
+    ev_tun.data.fd = tun_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, tun_fd, &ev_tun) < 0) {
+        ev_tun.events = EPOLLIN;
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, tun_fd, &ev_tun);
+    }
+
+    const int batch_size = (cfg.recv_batch_size > 0) ? cfg.recv_batch_size : 32;
+
+    std::vector<uint8_t> buffer(BUFFER_SIZE);
+    std::vector<uint8_t> dec_buf(INTERNAL_BUF_SIZE);
+    std::vector<uint8_t> enc_buf(INTERNAL_BUF_SIZE);
+    std::vector<uint8_t> out_buf(BUFFER_SIZE);
+
+#ifdef __linux__
+    struct PacketSlot {
+        std::vector<uint8_t> buf;
+        struct sockaddr_in addr;
+        struct iovec iov;
+    };
+    std::vector<PacketSlot> slots;
+    std::vector<struct mmsghdr> msgvec;
+    if (batch_size > 1) {
+        slots.resize(batch_size);
+        msgvec.resize(batch_size);
+        for (int i = 0; i < batch_size; ++i) {
+            slots[i].buf.resize(BUFFER_SIZE);
+            std::memset(&slots[i].addr, 0, sizeof(slots[i].addr));
+            slots[i].iov.iov_base = slots[i].buf.data();
+            slots[i].iov.iov_len = slots[i].buf.size();
+
+            std::memset(&msgvec[i], 0, sizeof(msgvec[i]));
+            msgvec[i].msg_hdr.msg_iov = &slots[i].iov;
+            msgvec[i].msg_hdr.msg_iovlen = 1;
+            msgvec[i].msg_hdr.msg_name = &slots[i].addr;
+            msgvec[i].msg_hdr.msg_namelen = sizeof(slots[i].addr);
+        }
+    }
+#endif
+
+    auto process_udp_packet = [&](int fd, const struct sockaddr_in& caddr, uint8_t* pkt_data, ssize_t len, double now) {
+        if (len < 0) return;
+
+        uint32_t ip_num = caddr.sin_addr.s_addr;
+        {
+            std::lock_guard<std::mutex> lock(security_mu);
+            auto ban_it = banned_ips.find(ip_num);
+            if (ban_it != banned_ips.end() && now < ban_it->second) return;
+        }
+
+        if (pkt_data[0] == 0x04 && (size_t)len >= 97) {
+            ResumptionToken rtok;
+            memcpy(&rtok, pkt_data + 1, 96);
+            uint64_t resumed_sid = 0;
+            uint32_t resumed_ip = 0;
+            Session* resumed_sess = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(sessions_mu);
+                for (auto& kv : sessions) {
+                    if (g_resumption.verify(rtok, kv.second->master_key, resumed_sid, resumed_ip)) {
+                        resumed_sess = kv.second;
+                        break;
+                    }
+                }
+            }
+            if (resumed_sess) {
+                Session* s = resumed_sess;
+                {
+                    std::lock_guard<std::mutex> slk(s->mu);
+                    s->client_addr = caddr;
+                    s->has_client = true;
+                    s->last_activity = now;
+                    s->last_server_fd = fd;
+                    s->session_id = resumed_sid;
+
+                    // FIX Blocker 2: Restore full cryptographic state and forward-secret session keys
+                    hkdf_expand(s->master_key, 32, "aegs-c2s", s->session_keys.recv_key, 32);
+                    hkdf_expand(s->master_key, 32, "aegs-s2c", s->session_keys.send_key, 32);
+                    s->v3_handshake_done = true;
+                    s->tx_seq = 0;
+                    s->replay_filter = AntiReplayFilter();
+                }
+                // Update O(1) fast-path endpoint cache
+                {
+                    std::lock_guard<std::mutex> ep_lock(g_endpoint_mu);
+                    g_endpoint_cache[make_endpoint_key(ip_num, caddr.sin_port)] = s;
+                }
+                if (resumed_ip) {
+                    std::lock_guard<std::mutex> lk(sessions_mu);
+                    if (!s->assigned_ip) {
+                        s->assigned_ip = resumed_ip;
+                        ip_to_session[s->assigned_ip] = s;
+                    }
+                }
+                ResumptionToken new_tok;
+                if (g_resumption.issue(s->session_id, s->assigned_ip, s->master_key, new_tok)) {
+                    uint8_t rpkt[97];
+                    rpkt[0] = 0x03;
+                    memcpy(rpkt + 1, &new_tok, 96);
+                    sendto(fd, rpkt, 97, 0, (struct sockaddr*)&caddr, sizeof(caddr));
+                }
+                std::cout << "[RESUME] Session resumed with restored crypto state for " << inet_ntoa(caddr.sin_addr) << " (" << IpPool::to_string(s->assigned_ip) << ")\n";
+            }
+            return;
+        }
+
+        if (pkt_data[0] == 0x01 && (size_t)len >= 72) {
+            uint64_t key_id_out = 0;
+            if (hs_server.process_init(pkt_data, len, key_id_out)) {
+                char kid_hex[17];
+                for (int j = 0; j < 8; j++) sprintf(&kid_hex[j*2], "%02x", ((uint8_t*)&key_id_out)[j]);
+                kid_hex[16] = 0;
+                Session* s = nullptr;
+                {
+                    std::lock_guard<std::mutex> lk(sessions_mu);
+                    auto sit = sessions.find(kid_hex);
+                    if (sit != sessions.end()) s = sit->second;
+                }
+                if (s) {
+                    auto maybe_ip = ip_pool.allocate();
+                    if (!maybe_ip) { std::cerr << "IP pool exhausted\n"; return; }
+                    {
+                        std::lock_guard<std::mutex> lk(sessions_mu);
+                        if (s->assigned_ip) {
+                            ip_pool.release(s->assigned_ip);
+                            ip_to_session.erase(s->assigned_ip);
+                        }
+                        s->assigned_ip = *maybe_ip;
+                        ip_to_session[s->assigned_ip] = s;
+                    }
+                    
+                    SessionKeys sk;
+                    auto resp = hs_server.build_resp(key_id_out, s->assigned_ip, 1400, sk);
+                    {
+                        std::lock_guard<std::mutex> slk(s->mu);
+                        s->session_keys = sk;
+                        s->session_id = sk.session_id;
+                        s->client_addr = caddr;
+                        s->has_client = true;
+                        s->v3_handshake_done = true;
+                        s->last_activity = now;
+                        s->last_server_fd = fd;
+                    }
+                    // Register in O(1) fast-path cache
+                    {
+                        std::lock_guard<std::mutex> ep_lock(g_endpoint_mu);
+                        g_endpoint_cache[make_endpoint_key(ip_num, caddr.sin_port)] = s;
+                    }
+                    sendto(fd, resp.data(), resp.size(), 0, (struct sockaddr*)&caddr, sizeof(caddr));
+                    std::cout << "[HS] Client " << inet_ntoa(caddr.sin_addr) << " assigned " << IpPool::to_string(s->assigned_ip) << "\n";
+                    
+                    ResumptionToken rtok;
+                    if (g_resumption.issue(s->session_id, s->assigned_ip, s->master_key, rtok)) {
+                        uint8_t rtok_pkt[97];
+                        rtok_pkt[0] = 0x03; // RESUMPTION_TOKEN
+                        memcpy(rtok_pkt + 1, &rtok, 96);
+                        sendto(fd, rtok_pkt, 97, 0, (struct sockaddr*)&caddr, sizeof(caddr));
+                        std::cout << "[HS] Resumption token issued for " << inet_ntoa(caddr.sin_addr) << "\n";
+                    }
+                }
+            }
+            return;
+        }
+
+        // AEGS v2 Min Outer Size: HDR_IV(12) + MASKED_HDR(16) + AEAD_IV(12) + TAG(16) = 56 bytes
+        if (len < 56) { record_fail(fd, caddr, pkt_data, (size_t)len, ip_num, now, 1.0); return; }
+
+        const uint8_t* hdr_iv = pkt_data;
+        Session* matched_sess = nullptr;
+        uint8_t unmasked_hdr[16];
+
+        // FIX Blocker 5: Fast-path O(1) lookup using client endpoint cache
+        uint64_t ep_key = make_endpoint_key(ip_num, caddr.sin_port);
+        Session* fast_sess = nullptr;
+        {
+            std::lock_guard<std::mutex> ep_lock(g_endpoint_mu);
+            auto it = g_endpoint_cache.find(ep_key);
+            if (it != g_endpoint_cache.end()) fast_sess = it->second;
+        }
+
+        if (fast_sess && mask_unmask_header(pkt_data + 12, 16, fast_sess->mask_key, hdr_iv, unmasked_hdr)) {
+            if (std::memcmp(unmasked_hdr, &fast_sess->key_id_raw, 8) == 0 && std::memcmp(unmasked_hdr + 12, VER_MAGIC.data(), 4) == 0) {
+                matched_sess = fast_sess;
+            }
+        }
+
+        // Slow-path fallback: scan registered sessions if new connection or roaming
+        if (!matched_sess) {
+            std::lock_guard<std::mutex> lk(sessions_mu);
+            for (auto& kv : sessions) {
+                Session* s = kv.second;
+                if (mask_unmask_header(pkt_data + 12, 16, s->mask_key, hdr_iv, unmasked_hdr)) {
+                    if (std::memcmp(unmasked_hdr, &s->key_id_raw, 8) == 0 && std::memcmp(unmasked_hdr + 12, VER_MAGIC.data(), 4) == 0) {
+                        matched_sess = s;
+                        std::lock_guard<std::mutex> ep_lock(g_endpoint_mu);
+                        g_endpoint_cache[ep_key] = s;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!matched_sess) { record_fail(fd, caddr, pkt_data, (size_t)len, ip_num, now, 1.0); return; }
+
+        Session* s = matched_sess;
+
+        // Verify incoming port hopping compliance if multi-port listening is active
+        if (ports.size() > 1 && s->v3_handshake_done) {
+            auto pit = fd_to_port.find(fd);
+            if (pit != fd_to_port.end() && !hopper.is_valid_port(s->session_keys.recv_key, pit->second)) {
+                // Packet arrived on an invalid port for this session's hopping epoch
+                record_fail(fd, caddr, pkt_data, (size_t)len, ip_num, now, 0.5);
+                return;
+            }
+        }
+
+        uint16_t junk_len = (unmasked_hdr[8] << 8) | unmasked_hdr[9];
+        size_t aead_offset = 12 + 16 + junk_len;
+        if ((size_t)len < aead_offset + 12 + TAG_LEN) { record_fail(fd, caddr, pkt_data, (size_t)len, ip_num, now, 0.5); return; }
+
+        const uint8_t* aead_nonce = pkt_data + aead_offset;
+        if (s->check_replay(aead_nonce)) return;
+
+        const uint8_t* ct = pkt_data + aead_offset + 12;
+        size_t ct_len = len - (aead_offset + 12);
+
+        size_t dec_len = 0;
+        uint8_t dec_key[32];
+        {
+            std::lock_guard<std::mutex> slk(s->mu);
+            if (!s->v3_handshake_done) {
+                record_fail(fd, caddr, pkt_data, (size_t)len, ip_num, now, 0.5);
+                return;
+            }
+            std::memcpy(dec_key, s->session_keys.recv_key, 32);
+        }
+        // FIX Blocker 3: Authenticate outer header (IV + masked header + junk) as AAD to prevent bit-flipping
+        if (!chacha20_poly1305_decrypt(ct, ct_len, dec_key, aead_nonce, dec_buf.data(), dec_len, pkt_data, aead_offset)) {
+            record_fail(fd, caddr, pkt_data, (size_t)len, ip_num, now, 0.5); return;
+        }
+
+        // Authentication passed! Securely update roaming endpoint & cache.
+        {
+            std::lock_guard<std::mutex> slk(s->mu);
+            s->client_addr = caddr; 
+            s->has_client = true;
+            s->last_activity = now;
+            s->last_server_fd = fd;
+        }
+        {
+            std::lock_guard<std::mutex> lock(security_mu);
+            failed_attempts.erase(ip_num);
+        }
+
+        if (unmasked_hdr[10] & 0x80) {
+            std::cout << "[DEBUG] Received CHAFF packet from " << inet_ntoa(caddr.sin_addr) << "\n";
+            return;
+        }
+
+        if (dec_len < 2) return;
+        uint16_t plen = (dec_buf[0] << 8) | dec_buf[1];
+        if (plen > 0 && plen <= dec_len - 2) {
+            std::lock_guard<std::mutex> tlk(tun_write_mu);
+            tun.write_packet(dec_buf.data() + 2, plen);  
+        }
+    };
+
+    struct epoll_event events[MAX_EVENTS];
+
+    while (g_running) {
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+        if (nfds < 0) {
+            if (errno == EINTR) {
+                if (!g_running) break;
+                continue;
+            }
+            perror("epoll_wait");
+            break;
+        }
+
+        double now = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+        cleanup_maps(now, ip_pool);
+
+        for (int i = 0; i < nfds; ++i) {
+            int fd = events[i].data.fd;
+
+            if (server_fd_set.count(fd)) {
+#ifdef __linux__
+                if (batch_size > 1) {
+                    for (int b = 0; b < batch_size; ++b) {
+                        msgvec[b].msg_hdr.msg_namelen = sizeof(slots[b].addr);
+                        slots[b].iov.iov_len = slots[b].buf.size();
+                    }
+                    int pkts = recvmmsg(fd, msgvec.data(), batch_size, MSG_DONTWAIT, nullptr);
+                    if (pkts > 0) {
+                        for (int p = 0; p < pkts; ++p) {
+                            ssize_t plen = msgvec[p].msg_len;
+                            process_udp_packet(fd, slots[p].addr, slots[p].buf.data(), plen, now);
+                        }
+                    } else if (pkts < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                        // Socket drained
+                    } else {
+                        // Graceful fallback to recvfrom
+                        struct sockaddr_in caddr {};
+                        socklen_t clen = sizeof(caddr);
+                        ssize_t len = recvfrom(fd, buffer.data(), buffer.size(), 0, (struct sockaddr*)&caddr, &clen);
+                        if (len >= 0) {
+                            process_udp_packet(fd, caddr, buffer.data(), len, now);
+                        }
+                    }
+                } else {
+                    struct sockaddr_in caddr {};
+                    socklen_t clen = sizeof(caddr);
+                    ssize_t len = recvfrom(fd, buffer.data(), buffer.size(), 0, (struct sockaddr*)&caddr, &clen);
+                    if (len >= 0) {
+                        process_udp_packet(fd, caddr, buffer.data(), len, now);
+                    }
+                }
+#else
+                struct sockaddr_in caddr {};
+                socklen_t clen = sizeof(caddr);
+                ssize_t len = recvfrom(fd, buffer.data(), buffer.size(), 0, (struct sockaddr*)&caddr, &clen);
+                if (len >= 0) {
+                    process_udp_packet(fd, caddr, buffer.data(), len, now);
+                }
+#endif
+            } else if (fd == tun_fd) {
+                while (true) {
+                    ssize_t n = tun.read_packet(buffer.data(), buffer.size());
+                    if (n < 0) {
+                        break; // EAGAIN / EWOULDBLOCK
+                    }
+                    if (n < 20) continue; 
+
+                    uint32_t dst_ip = (uint32_t(buffer[16]) << 24) | (uint32_t(buffer[17]) << 16)
+                                    | (uint32_t(buffer[18]) << 8)  |  uint32_t(buffer[19]);
+
+                    Session* s = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lk(sessions_mu);
+                        auto ip_it = ip_to_session.find(dst_ip);
+                        if (ip_it != ip_to_session.end()) s = ip_it->second;
+                    }
+                    if (!s) continue;
+
+                    struct sockaddr_in client_addr {};
+                    int send_fd = -1;
+                    uint8_t enc_key[32];
+                    uint64_t seq = 0;
+                    uint64_t s_key_id_raw = 0;
+                    uint8_t s_mask_key[32];
+
+                    {
+                        std::lock_guard<std::mutex> slk(s->mu);
+                        if (!s->has_client || s->last_server_fd < 0 || !s->v3_handshake_done) continue;
+                        s->last_activity = now;
+                        client_addr = s->client_addr;
+                        send_fd = s->last_server_fd;
+                        s_key_id_raw = s->key_id_raw;
+                        std::memcpy(s_mask_key, s->mask_key, 32);
+                        std::memcpy(enc_key, s->session_keys.send_key, 32);
+                        seq = ++(s->tx_seq);
+                    }
+
+                    size_t pad_len = shaper.semantic_pad((size_t)n);
+                    size_t frame_len = FRAME_HDR + (size_t)n + pad_len;
+                    if (frame_len + TAG_LEN > dec_buf.size()) { pad_len = 0; frame_len = FRAME_HDR + (size_t)n; }
+
+                    uint16_t plen_be = htons((uint16_t)n);
+                    std::memcpy(dec_buf.data(), &plen_be, 2);
+                    std::memcpy(dec_buf.data() + 2, buffer.data(), (size_t)n);
+                    if (pad_len > 0) TrafficShaper::fill_random_padding(dec_buf.data() + 2 + n, pad_len);
+
+                    uint8_t aead_nonce[12] = {0};
+                    std::memcpy(aead_nonce, &seq, sizeof(uint64_t));
+                    RAND_bytes(aead_nonce + 8, 4);
+
+                    uint16_t junk_len = generate_junk_len();
+
+                    uint8_t hdr_plain[16];
+                    std::memcpy(hdr_plain, &s_key_id_raw, 8);
+                    hdr_plain[8] = (junk_len >> 8) & 0xFF;
+                    hdr_plain[9] = junk_len & 0xFF;
+                    hdr_plain[10] = 0; hdr_plain[11] = 0;
+                    std::memcpy(hdr_plain + 12, VER_MAGIC.data(), 4);
+
+                    uint8_t hdr_iv[12]; RAND_bytes(hdr_iv, 12);
+                    uint8_t masked_hdr[16];
+                    if (mask_unmask_header(hdr_plain, 16, s_mask_key, hdr_iv, masked_hdr)) {
+                        size_t out_len = 0;
+                        std::memcpy(out_buf.data(), hdr_iv, 12); out_len += 12;
+                        std::memcpy(out_buf.data() + out_len, masked_hdr, 16); out_len += 16;
+                        if (junk_len > 0) {
+                            RAND_bytes(out_buf.data() + out_len, (int)junk_len);
+                            out_len += junk_len;
+                        }
+                        size_t aead_offset = out_len;
+                        std::memcpy(out_buf.data() + out_len, aead_nonce, 12); out_len += 12;
+
+                        size_t enc_len = 0;
+                        // FIX Blocker 3: Authenticate outer header as AAD in AEAD Poly1305
+                        if (chacha20_poly1305_encrypt(dec_buf.data(), frame_len, enc_key, aead_nonce, enc_buf.data(), enc_len, out_buf.data(), aead_offset)) {
+                            std::memcpy(out_buf.data() + out_len, enc_buf.data(), enc_len); out_len += enc_len;
+                            sendto(send_fd, out_buf.data(), out_len, 0, (struct sockaddr*)&client_addr, sizeof(client_addr));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (int sfd : server_fds) {
+        close(sfd);
+    }
+    close(epoll_fd);
+}
+
 int main() {
+    // Setup signal handling for clean shutdown
+    struct sigaction sa {};
+    sa.sa_handler = handle_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    signal(SIGPIPE, SIG_IGN);
     AegsConfig cfg = AegsConfig::from_env();
     sqlite3* db;
     if (sqlite3_open(cfg.db_path.c_str(), &db) == SQLITE_OK) {
@@ -286,10 +869,15 @@ int main() {
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 Session* s = new Session();
                 s->key_id_hex = (const char*)sqlite3_column_text(stmt, 0);
+                s->key_id_raw = 0;
+                for (int k = 0; k < 8; ++k) {
+                    unsigned int b = 0;
+                    std::sscanf(s->key_id_hex.c_str() + (k * 2), "%02x", &b);
+                    ((uint8_t*)&s->key_id_raw)[k] = (uint8_t)b;
+                }
                 std::string token = (const char*)sqlite3_column_text(stmt, 1);
                 if (!derive_master_key(token, s->key_id_hex, s->master_key) ||
-                    !hkdf_expand(s->master_key, 32, "aegis-v2-header-mask", s->mask_key, 32) ||
-                    !hkdf_expand(s->master_key, 32, "aegis-v2-payload-key", s->payload_key, 32)) {
+                    !hkdf_expand(s->master_key, 32, "aegis-v2-header-mask", s->mask_key, 32)) {
                     std::cerr << "key derivation / HKDF failed for " << s->key_id_hex << "\n";
                     delete s;
                     continue;
@@ -316,12 +904,7 @@ int main() {
     // using user's MasterKey (secret), not the server's public key.
     std::unordered_map<uint64_t, std::vector<uint8_t>> master_key_map;
     for (auto& kv : sessions) {
-        uint64_t kid = 0;
-        for (int i = 0; i < 8; i++) {
-            unsigned int b;
-            sscanf(kv.second->key_id_hex.c_str() + i*2, "%02x", &b);
-            ((uint8_t*)&kid)[i] = (uint8_t)b;
-        }
+        uint64_t kid = kv.second->key_id_raw;
         user_map[kid] = kv.first; 
         master_key_map[kid] = std::vector<uint8_t>(
             kv.second->master_key, kv.second->master_key + 32);
@@ -349,259 +932,54 @@ int main() {
     TrafficShaper shaper(5, false);
     shaper.set_semantic_enabled(true);
 
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd < 0) { perror("epoll_create1"); return 1; }
-    struct epoll_event ev {}, events[MAX_EVENTS];
-
     PortHopper hopper(cfg.base_port, cfg.port_count, cfg.hop_interval_sec);
     auto ports = hopper.server_ports();
 
-    std::vector<int> server_fds;
-    std::unordered_set<int> server_fd_set; // for O(1) lookup in epoll loop
-    for (uint16_t port : ports) {
-        int sfd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sfd < 0) { perror("socket"); return 1; }
-        if (!set_nonblocking(sfd)) { perror("fcntl"); return 1; }
-        int sock_buf_size = 4 * 1024 * 1024;
-        setsockopt(sfd, SOL_SOCKET, SO_RCVBUF, &sock_buf_size, sizeof(sock_buf_size));
-        setsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &sock_buf_size, sizeof(sock_buf_size));
-        int reuse = 1;
-        setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-        struct sockaddr_in sa {};
-        sa.sin_family = AF_INET; sa.sin_addr.s_addr = INADDR_ANY; sa.sin_port = htons(port);
-        if (bind(sfd, (struct sockaddr*)&sa, sizeof(sa)) < 0) { perror("bind"); return 1; }
-        struct epoll_event ev_s {};
-        ev_s.events = EPOLLIN; ev_s.data.fd = sfd;
-        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sfd, &ev_s);
-        server_fds.push_back(sfd);
-        server_fd_set.insert(sfd);
-    }
-    
-    int tun_fd = tun.fd();
-    ev.events = EPOLLIN; ev.data.fd = tun_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, tun_fd, &ev);
-
-    std::vector<uint8_t> buffer(BUFFER_SIZE);
-    std::vector<uint8_t> dec_buf(INTERNAL_BUF_SIZE);
-    std::vector<uint8_t> enc_buf(INTERNAL_BUF_SIZE);
-
-    std::cout << "[AEGS v4 Server] Port Hopping active on ports " << cfg.base_port << "-" << (cfg.base_port + cfg.port_count - 1) << " (" << cfg.port_count << " ports, " << cfg.hop_interval_sec << "s interval)\n";
-
-    while (true) {
-        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
-        double now = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
-        cleanup_maps(now, epoll_fd);
-
-        for (int i = 0; i < nfds; ++i) {
-            int fd = events[i].data.fd;
-
-            if (server_fd_set.count(fd)) {
-                struct sockaddr_in caddr; socklen_t clen = sizeof(caddr);
-                ssize_t len = recvfrom(fd, buffer.data(), buffer.size(), 0, (struct sockaddr*)&caddr, &clen);
-                if (len < 0) continue;
-
-                std::string ip = inet_ntoa(caddr.sin_addr);
-                auto ban_it = banned_ips.find(ip);
-                if (ban_it != banned_ips.end() && now < ban_it->second) continue;
-
-                if (buffer[0] == 0x04 && (size_t)len >= 97) {
-                    ResumptionToken rtok;
-                    memcpy(&rtok, buffer.data() + 1, 96);
-                    uint64_t resumed_sid = 0;
-                    uint32_t resumed_ip = 0;
-                    // Try to verify against all users' master keys
-                    for (auto& kv : sessions) {
-                        if (g_resumption.verify(rtok, kv.second->master_key, resumed_sid, resumed_ip)) {
-                            Session* s = kv.second;
-                            // Restore session
-                            s->client_addr = caddr;
-                            s->has_client = true;
-                            s->last_activity = now;
-                            s->last_server_fd = fd;
-                            if (resumed_ip && !s->assigned_ip) {
-                                s->assigned_ip = resumed_ip;
-                                ip_to_session[s->assigned_ip] = s;
-                            }
-                            // Send new resumption token for next reconnect
-                            ResumptionToken new_tok;
-                            if (g_resumption.issue(s->session_id, s->assigned_ip, s->master_key, new_tok)) {
-                                uint8_t rpkt[97];
-                                rpkt[0] = 0x03;
-                                memcpy(rpkt + 1, &new_tok, 96);
-                                sendto(fd, rpkt, 97, 0, (struct sockaddr*)&caddr, sizeof(caddr));
-                            }
-                            std::cout << "[RESUME] Session resumed for " << ip << " (" << IpPool::to_string(s->assigned_ip) << ")\n";
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                if (buffer[0] == 0x01 && (size_t)len >= 72) {
-                    uint64_t key_id_out = 0;
-                    if (hs_server.process_init(buffer.data(), len, key_id_out)) {
-                        char kid_hex[17];
-                        for (int j = 0; j < 8; j++) sprintf(&kid_hex[j*2], "%02x", ((uint8_t*)&key_id_out)[j]);
-                        kid_hex[16] = 0;
-                        auto sit = sessions.find(kid_hex);
-                        if (sit != sessions.end()) {
-                            Session* s = sit->second;
-                            auto maybe_ip = ip_pool.allocate();
-                            if (!maybe_ip) { std::cerr << "IP pool exhausted\n"; continue; }
-                            if (s->assigned_ip) { ip_pool.release(s->assigned_ip); ip_to_session.erase(s->assigned_ip); }
-                            s->assigned_ip = *maybe_ip;
-                            ip_to_session[s->assigned_ip] = s;
-                            
-                            SessionKeys sk;
-                            auto resp = hs_server.build_resp(key_id_out, s->assigned_ip, 1400, sk);
-                            s->session_keys = sk;
-                            s->session_id = sk.session_id;
-                            s->client_addr = caddr;
-                            s->has_client = true;
-                            s->v3_handshake_done = true;
-                            s->last_activity = now;
-                            s->last_server_fd = fd;
-                            sendto(fd, resp.data(), resp.size(), 0, (struct sockaddr*)&caddr, sizeof(caddr));
-                            std::cout << "[HS] Client " << ip << " assigned " << IpPool::to_string(s->assigned_ip) << "\n";
-                            
-                            ResumptionToken rtok;
-                            if (g_resumption.issue(s->session_id, s->assigned_ip, s->master_key, rtok)) {
-                                uint8_t rtok_pkt[97];
-                                rtok_pkt[0] = 0x03; // RESUMPTION_TOKEN
-                                memcpy(rtok_pkt + 1, &rtok, 96);
-                                sendto(fd, rtok_pkt, 97, 0, (struct sockaddr*)&caddr, sizeof(caddr));
-                                std::cout << "[HS] Resumption token issued for " << ip << "\n";
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                // AEGS v2 Min Outer Size: HDR_IV(12) + MASKED_HDR(16) + AEAD_IV(12) + TAG(16) = 56 bytes
-                if (len < 56) { record_fail(fd, caddr, buffer.data(), (size_t)len, ip, now, 1.0); continue; }
-
-                const uint8_t* hdr_iv = buffer.data();
-                Session* matched_sess = nullptr;
-                uint8_t unmasked_hdr[16];
-
-                // Attempt to unmask header against registered user sessions
-                for (auto& kv : sessions) {
-                    Session* s = kv.second;
-                    if (mask_unmask_header(buffer.data() + 12, 16, s->mask_key, hdr_iv, unmasked_hdr)) {
-                        char kid[17];
-                        for (int j = 0; j < 8; ++j) sprintf(&kid[j * 2], "%02x", unmasked_hdr[j]);
-                        kid[16] = '\0';
-                        if (s->key_id_hex == kid && std::memcmp(unmasked_hdr + 12, VER_MAGIC.data(), 4) == 0) {
-                            matched_sess = s;
-                            break;
-                        }
-                    }
-                }
-
-                if (!matched_sess) { record_fail(fd, caddr, buffer.data(), (size_t)len, ip, now, 1.0); continue; }
-
-                Session* s = matched_sess;
-
-                uint16_t junk_len = (unmasked_hdr[8] << 8) | unmasked_hdr[9];
-                size_t aead_offset = 12 + 16 + junk_len;
-                if ((size_t)len < aead_offset + 12 + TAG_LEN) { record_fail(fd, caddr, buffer.data(), (size_t)len, ip, now, 0.5); continue; }
-
-                const uint8_t* aead_nonce = buffer.data() + aead_offset;
-                if (s->check_replay(aead_nonce)) continue;
-
-                const uint8_t* ct = buffer.data() + aead_offset + 12;
-                size_t ct_len = len - (aead_offset + 12);
-
-                size_t dec_len = 0;
-                const uint8_t* dec_key = s->v3_handshake_done ? s->session_keys.send_key : s->payload_key;
-                if (!chacha20_poly1305_decrypt(ct, ct_len, dec_key, aead_nonce, dec_buf.data(), dec_len)) {
-                    record_fail(fd, caddr, buffer.data(), (size_t)len, ip, now, 0.5); continue;
-                }
-
-                // Authentication passed! Securely update roaming endpoint.
-                s->client_addr = caddr; 
-                s->has_client = true;
-                s->last_activity = now;
-                failed_attempts.erase(ip);
-
-                if (unmasked_hdr[10] & 0x80) {
-                    std::cout << "[DEBUG] Received CHAFF packet from " << ip << "\n";
-                    continue;
-                }
-
-                if (dec_len < 2) continue;
-                uint16_t plen = (dec_buf[0] << 8) | dec_buf[1];
-                if (plen > 0 && plen <= dec_len - 2) {
-                    tun.write_packet(dec_buf.data() + 2, plen);  
-                }
-
-            } else if (fd == tun_fd) {
-                ssize_t n = tun.read_packet(buffer.data(), buffer.size());
-                if (n < 20) continue; 
-
-                uint32_t dst_ip = (uint32_t(buffer[16]) << 24) | (uint32_t(buffer[17]) << 16)
-                                | (uint32_t(buffer[18]) << 8)  |  uint32_t(buffer[19]);
-
-                auto ip_it = ip_to_session.find(dst_ip);
-                if (ip_it == ip_to_session.end()) continue;  
-                Session* s = ip_it->second;
-                if (!s->has_client) continue;
-                s->last_activity = now;
-
-                const uint8_t* enc_key = s->v3_handshake_done ? s->session_keys.recv_key : s->payload_key;
-
-                size_t pad_len = shaper.semantic_pad((size_t)n);
-                size_t frame_len = FRAME_HDR + (size_t)n + pad_len;
-                if (frame_len + TAG_LEN > dec_buf.size()) { pad_len = 0; frame_len = FRAME_HDR + (size_t)n; }
-
-                uint16_t plen_be = htons((uint16_t)n);
-                std::memcpy(dec_buf.data(), &plen_be, 2);
-                std::memcpy(dec_buf.data() + 2, buffer.data(), (size_t)n);
-                if (pad_len > 0) RAND_bytes(dec_buf.data() + 2 + n, (int)pad_len);
-
-                uint8_t aead_nonce[12] = {0};
-                s->tx_seq++;
-                std::memcpy(aead_nonce, &s->tx_seq, sizeof(uint64_t));
-                RAND_bytes(aead_nonce + 8, 4);
-
-                size_t enc_len = 0;
-                if (chacha20_poly1305_encrypt(dec_buf.data(), frame_len, enc_key, aead_nonce, enc_buf.data(), enc_len)) {
-                    uint16_t junk_len = generate_junk_len();
-
-                    uint8_t raw_kid[8];
-                    for (int k = 0; k < 8; ++k) {
-                        unsigned int b; std::sscanf(s->key_id_hex.c_str() + (k * 2), "%02x", &b);
-                        raw_kid[k] = (uint8_t)b;
-                    }
-
-                    uint8_t hdr_plain[16];
-                    std::memcpy(hdr_plain, raw_kid, 8);
-                    hdr_plain[8] = (junk_len >> 8) & 0xFF;
-                    hdr_plain[9] = junk_len & 0xFF;
-                    hdr_plain[10] = 0; hdr_plain[11] = 0;
-                    std::memcpy(hdr_plain + 12, VER_MAGIC.data(), 4);
-
-                    uint8_t hdr_iv[12]; RAND_bytes(hdr_iv, 12);
-                    uint8_t masked_hdr[16];
-                    if (mask_unmask_header(hdr_plain, 16, s->mask_key, hdr_iv, masked_hdr)) {
-                        static thread_local std::vector<uint8_t> out_buf(BUFFER_SIZE);
-                        size_t out_len = 0;
-                        std::memcpy(out_buf.data(), hdr_iv, 12); out_len += 12;
-                        std::memcpy(out_buf.data() + out_len, masked_hdr, 16); out_len += 16;
-                        if (junk_len > 0) {
-                            RAND_bytes(out_buf.data() + out_len, (int)junk_len);
-                            out_len += junk_len;
-                        }
-                        std::memcpy(out_buf.data() + out_len, aead_nonce, 12); out_len += 12;
-                        std::memcpy(out_buf.data() + out_len, enc_buf.data(), enc_len); out_len += enc_len;
-
-                        sendto(s->last_server_fd, out_buf.data(), out_len, 0, (struct sockaddr*)&s->client_addr, sizeof(s->client_addr));
-                    }
-                }
-            }
+    // Determine worker thread count:
+    // cfg.worker_threads defaulting to 1 if 0, or up to std::thread::hardware_concurrency() when specified
+    int num_workers = cfg.worker_threads;
+    if (num_workers <= 0) {
+        num_workers = 1;
+    } else {
+        unsigned int hw = std::thread::hardware_concurrency();
+        if (hw > 0 && (unsigned int)num_workers > hw) {
+            num_workers = static_cast<int>(hw);
         }
     }
 
+    std::cout << "[AEGS v4 Server] Port Hopping active on ports " << cfg.base_port << "-" << (cfg.base_port + cfg.port_count - 1)
+              << " (" << cfg.port_count << " ports, " << cfg.hop_interval_sec << "s interval)\n";
+    std::cout << "[AEGS v4 Server] Worker threads: " << num_workers
+              << (num_workers > 1 ? " (SO_REUSEPORT active)" : "")
+              << ", Batch size: " << cfg.recv_batch_size << "\n";
+
+    if (num_workers > 1) {
+        std::vector<std::thread> workers;
+        workers.reserve(num_workers);
+        for (int i = 0; i < num_workers; ++i) {
+            workers.emplace_back(worker_loop, i, num_workers, std::cref(cfg), std::cref(ports),
+                                 std::ref(tun), std::ref(hs_server), std::ref(ip_pool), std::ref(shaper));
+        }
+        for (auto& t : workers) {
+            if (t.joinable()) t.join();
+        }
+    } else {
+        worker_loop(0, 1, cfg, ports, tun, hs_server, ip_pool, shaper);
+    }
+
+    std::cout << "[AEGS v4 Server] Shutting down...\n";
     nat.teardown();
     tun.close();
+
+    {
+        std::lock_guard<std::mutex> lk(sessions_mu);
+        for (auto& kv : sessions) {
+            delete kv.second;
+        }
+        sessions.clear();
+        ip_to_session.clear();
+    }
+
+    std::cout << "[AEGS v4 Server] Clean shutdown complete.\n";
     return 0;
 }

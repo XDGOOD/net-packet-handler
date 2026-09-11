@@ -11,20 +11,65 @@
 #include <openssl/rand.h>
 
 // ---------------------------------------------------------------------------
-// Rate limiter
+// Rate limiter (Token-bucket with packet & byte ceilings)
 // ---------------------------------------------------------------------------
 bool BlackholeResponder::should_respond(const std::string& ip, double now,
-                                        double max_rate) {
-    auto it = last_response_.find(ip);
-    if (it != last_response_.end() && (now - it->second) < max_rate)
+                                        double max_rate,
+                                        size_t estimated_bytes) {
+    if (max_rate <= 0.0) max_rate = kDefaultMaxRate;
+
+    auto it = rate_limits_.find(ip);
+    if (it == rate_limits_.end()) {
+        RateLimitEntry entry;
+        entry.tokens = kBucketCapacity - 1.0; // Consume 1 token for this response
+        entry.last_refill = now;
+        entry.window_start = now;
+        entry.total_packets = 1;
+        entry.total_bytes = estimated_bytes;
+        rate_limits_[ip] = entry;
+        return true;
+    }
+
+    RateLimitEntry& entry = it->second;
+
+    // Reset window if duration has elapsed
+    if ((now - entry.window_start) >= kWindowDurationSec) {
+        entry.window_start = now;
+        entry.total_packets = 0;
+        entry.total_bytes = 0;
+    }
+
+    // Enforce upper ceiling on total bytes/packets sent per IP (Audit issue 4.4)
+    if (entry.total_packets >= kMaxPacketsPerIp || entry.total_bytes >= kMaxBytesPerIp) {
         return false;
-    last_response_[ip] = now;
+    }
+
+    // Refill tokens
+    double dt = now - entry.last_refill;
+    if (dt > 0.0) {
+        double refill_rate = 1.0 / max_rate;
+        entry.tokens += dt * refill_rate;
+        if (entry.tokens > kBucketCapacity) {
+            entry.tokens = kBucketCapacity;
+        }
+        entry.last_refill = now;
+    }
+
+    // Check if token bucket has at least 1 token
+    if (entry.tokens < 1.0) {
+        return false;
+    }
+
+    // Consume token and update packet & byte counters
+    entry.tokens -= 1.0;
+    entry.total_packets += 1;
+    entry.total_bytes += estimated_bytes;
 
     // Periodic cleanup: drop entries older than 60 s to prevent unbounded growth
-    if (last_response_.size() > 10000) {
-        for (auto jt = last_response_.begin(); jt != last_response_.end(); ) {
-            if (now - jt->second > 60.0)
-                jt = last_response_.erase(jt);
+    if (rate_limits_.size() > 10000) {
+        for (auto jt = rate_limits_.begin(); jt != rate_limits_.end(); ) {
+            if (now - jt->second.last_refill > kWindowDurationSec)
+                jt = rate_limits_.erase(jt);
             else
                 ++jt;
         }
@@ -32,12 +77,22 @@ bool BlackholeResponder::should_respond(const std::string& ip, double now,
     return true;
 }
 
+void BlackholeResponder::record_response(const std::string& ip, size_t bytes_sent) {
+    auto it = rate_limits_.find(ip);
+    if (it != rate_limits_.end()) {
+        if (bytes_sent > 80) {
+            it->second.total_bytes += (bytes_sent - 80);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Strategy selector
 // ---------------------------------------------------------------------------
 std::vector<uint8_t> BlackholeResponder::generate_response(
         const uint8_t* probe_data, size_t probe_len) {
-    if (probe_len < 4) return {};
+    // Silently drop short probes to prevent UDP amplification attacks (Audit issue 4.4)
+    if (!probe_data || probe_len < kMinProbeLen) return {};
 
     // Derive a pseudo-random selector from probe entropy (no CSPRNG call needed)
     uint8_t selector = 0;
@@ -208,31 +263,20 @@ std::vector<uint8_t> BlackholeResponder::quic_retry(
 // ---------------------------------------------------------------------------
 std::vector<uint8_t> BlackholeResponder::quic_connection_close(
         const uint8_t* probe_data, size_t probe_len) {
-    // Simplified 1-RTT short header Connection Close
-    // Layout:
-    //   0:     0x40 | (random & 0x3F)  -- Short Header, Fixed bit set
-    //   1-8:   DCID (8 bytes, from probe entropy)
-    //   9:     Packet Number (1 byte, 0x01)
-    //  10:     Frame type = 0x1C (CONNECTION_CLOSE)
-    //  11-18:  Error code (varint) + Frame Type + Reason phrase
-    //  rest:   random padding to look like encrypted data
-
+    // In real QUIC, 1-RTT short header packets are ALWAYS fully encrypted with AEAD.
+    // There is NEVER plaintext ASCII (such as "unsupported version") on the wire.
+    // To an external observer or DPI, all bytes after DCID must look like high-entropy
+    // ciphertext + Poly1305/GCM authentication tag (Shannon entropy > 7.5).
     uint8_t dcid[8] = {0};
     size_t copy_len = (probe_len < 8) ? probe_len : 8;
     if (probe_len > 0) std::memcpy(dcid, probe_data, copy_len);
 
-    // Reason phrase
-    static const char* reason = "unsupported version";
-    size_t reason_len = strlen(reason);
-
-    // Total packet: header(1) + dcid(8) + pn(1) + frame_type(1) +
-    //               error_code(2) + trigger_frame(1) + reason_len_varint(1) +
-    //               reason + random_padding(8)
-    size_t pkt_len = 1 + 8 + 1 + 1 + 2 + 1 + 1 + reason_len + 8;
+    // Realistic 1-RTT packet length: header(1) + dcid(8) + encrypted payload + tag (41B) = 50B
+    size_t pkt_len = 1 + 8 + 41;
     std::vector<uint8_t> pkt(pkt_len, 0);
     size_t off = 0;
 
-    // Short header with random low bits
+    // Short header with random low bits (Fixed bit 0x40 set)
     uint8_t hdr_byte = 0x40;
     if (probe_len > 1) hdr_byte |= (probe_data[1] & 0x3F);
     pkt[off++] = hdr_byte;
@@ -241,30 +285,9 @@ std::vector<uint8_t> BlackholeResponder::quic_connection_close(
     std::memcpy(&pkt[off], dcid, 8);
     off += 8;
 
-    // Packet number (single byte)
-    pkt[off++] = 0x01;
+    // Remainder of packet is AEAD ciphertext simulation: 100% cryptographic entropy,
+    // zero identifiable plain strings.
+    RAND_bytes(&pkt[off], pkt_len - off);
 
-    // CONNECTION_CLOSE frame (type 0x1C = transport layer)
-    pkt[off++] = 0x1C;
-
-    // Error code: 0x000A = PROTOCOL_VIOLATION (2-byte varint)
-    pkt[off++] = 0x00;
-    pkt[off++] = 0x0A;
-
-    // Frame type that triggered (0x00 = unknown)
-    pkt[off++] = 0x00;
-
-    // Reason phrase length (1-byte varint)
-    pkt[off++] = static_cast<uint8_t>(reason_len);
-
-    // Reason phrase
-    std::memcpy(&pkt[off], reason, reason_len);
-    off += reason_len;
-
-    // Random padding to simulate encrypted tail
-    RAND_bytes(&pkt[off], 8);
-    off += 8;
-
-    pkt.resize(off);
     return pkt;
 }

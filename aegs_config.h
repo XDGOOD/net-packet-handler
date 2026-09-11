@@ -60,6 +60,7 @@ struct AegsConfig {
         c.jitter_ms        = gi("AEGS_JITTER_MS",                   5);
         c.mtu              = gi("AEGS_MTU",                          1400);
         c.worker_threads   = gi("AEGS_WORKERS",                     0);
+        c.recv_batch_size  = gi("AEGS_RECV_BATCH_SIZE",             32);
         c.db_path          = gs("AEGS_DB_PATH",                     "/app/data/aegis.db");
         c.key_path         = gs("AEGS_KEY_PATH",                    "server_key.bin");
         c.session_idle_timeout = (double)gi("AEGS_SESSION_TIMEOUT", 180);

@@ -133,3 +133,19 @@ size_t TrafficShaper::semantic_pad(size_t actual_payload_len) noexcept {
         return t - total_with_hdr;
     }
 }
+
+// ---------------------------------------------------------------------------
+// fill_random_padding — Fast thread-local PRNG for internal AEAD padding
+// ---------------------------------------------------------------------------
+void TrafficShaper::fill_random_padding(uint8_t* dest, size_t len) noexcept {
+    auto& rng = thread_rng();
+    size_t i = 0;
+    for (; i + 4 <= len; i += 4) {
+        uint32_t val = rng();
+        std::memcpy(dest + i, &val, 4);
+    }
+    if (i < len) {
+        uint32_t val = rng();
+        std::memcpy(dest + i, &val, len - i);
+    }
+}
