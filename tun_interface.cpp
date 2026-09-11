@@ -80,7 +80,21 @@ ssize_t TunInterface::write_packet(const uint8_t* buf, size_t len) {
     return ::write(tun_fd_, buf, len);
 }
 
+static bool is_safe_identifier(const std::string& str) {
+    if (str.empty() || str.length() > 64) return false;
+    for (char c : str) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-' && c != '.' && c != '/') {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool TunInterface::add_route(const std::string& cidr) {
+    if (!is_safe_identifier(cidr) || !is_safe_identifier(iface_name_)) {
+        std::cerr << "[TunInterface] Invalid CIDR or interface name\n";
+        return false;
+    }
     std::string cmd = "ip route add " + cidr + " dev " + iface_name_;
     int ret = system(cmd.c_str());
     if (ret != 0) {
@@ -91,6 +105,10 @@ bool TunInterface::add_route(const std::string& cidr) {
 }
 
 bool TunInterface::set_default_route() {
+    if (!is_safe_identifier(iface_name_)) {
+        std::cerr << "[TunInterface] Invalid interface name\n";
+        return false;
+    }
     std::string cmd1 = "ip route add 0.0.0.0/1 dev " + iface_name_;
     std::string cmd2 = "ip route add 128.0.0.0/1 dev " + iface_name_;
     int ret1 = system(cmd1.c_str());
@@ -115,9 +133,17 @@ void TunInterface::parse_cidr(const std::string& cidr, std::string& ip, std::str
     }
     
     ip = cidr.substr(0, slash_pos);
-    int prefix = std::stoi(cidr.substr(slash_pos + 1));
+    int prefix = 32;
+    try {
+        prefix = std::stoi(cidr.substr(slash_pos + 1));
+    } catch (...) {
+        prefix = 32;
+    }
+    if (prefix < 0) prefix = 0;
+    if (prefix > 32) prefix = 32;
     
-    uint32_t mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF;
+    // FIX Audit: Avoid undefined behavior (0xFFFFFFFF << 32) when prefix is 0
+    uint32_t mask = (prefix == 0) ? 0u : (prefix == 32) ? 0xFFFFFFFFu : (~0u << (32 - prefix));
     struct in_addr addr;
     addr.s_addr = htonl(mask);
     netmask = inet_ntoa(addr);

@@ -251,12 +251,24 @@ static inline uint64_t make_endpoint_key(uint32_t ip, uint16_t port) {
     return (static_cast<uint64_t>(ip) << 16) | static_cast<uint64_t>(port);
 }
 
+const size_t MAX_ENDPOINT_CACHE = 4096;
+
+static inline void update_endpoint_cache(uint64_t ep_key, Session* s) {
+    std::lock_guard<std::mutex> ep_lock(g_endpoint_mu);
+    if (g_endpoint_cache.size() < MAX_ENDPOINT_CACHE || g_endpoint_cache.find(ep_key) != g_endpoint_cache.end()) {
+        g_endpoint_cache[ep_key] = s;
+    }
+}
+
 struct FailRecord { 
     double weight = 0; 
     double last_seen = 0; 
     int level = 0; 
     double last_fallback_dns = 0; // Token bucket rate limiter for DNS mimicry
 };
+const size_t MAX_FAILED_RECORDS = 10000;
+const size_t MAX_BANNED_RECORDS = 10000;
+
 std::unordered_map<uint32_t, FailRecord> failed_attempts;
 std::unordered_map<uint32_t, double> banned_ips;
 const int ban_levels[] = {0, 30, 300, 3600};
@@ -348,6 +360,11 @@ void record_fail(int fd, const struct sockaddr_in& caddr,
                   const uint8_t* probe_data, size_t probe_len,
                   uint32_t ip_num, double now, double weight) {
     std::lock_guard<std::mutex> lock(security_mu);
+    // Bounded map protection against DoS memory exhaustion from spoofed UDP flooding
+    if (failed_attempts.size() >= MAX_FAILED_RECORDS && failed_attempts.find(ip_num) == failed_attempts.end()) {
+        send_probing_fallback(fd, caddr, probe_data, probe_len, ip_num, now);
+        return;
+    }
     auto& rec = failed_attempts[ip_num];
     if (rec.level == 0) rec.level = 1;
     if (now - rec.last_seen > 120.0) { rec.weight = 0; }
@@ -358,7 +375,9 @@ void record_fail(int fd, const struct sockaddr_in& caddr,
 
     if (rec.weight >= 10.0) {
         int lvl = std::min(rec.level, 3);
-        banned_ips[ip_num] = now + ban_levels[lvl];
+        if (banned_ips.size() < MAX_BANNED_RECORDS || banned_ips.find(ip_num) != banned_ips.end()) {
+            banned_ips[ip_num] = now + ban_levels[lvl];
+        }
         rec.weight = 0; rec.level = lvl + 1;
     }
 }
@@ -519,10 +538,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                     s->replay_filter = AntiReplayFilter();
                 }
                 // Update O(1) fast-path endpoint cache
-                {
-                    std::lock_guard<std::mutex> ep_lock(g_endpoint_mu);
-                    g_endpoint_cache[make_endpoint_key(ip_num, caddr.sin_port)] = s;
-                }
+                update_endpoint_cache(make_endpoint_key(ip_num, caddr.sin_port), s);
                 if (resumed_ip) {
                     std::lock_guard<std::mutex> lk(sessions_mu);
                     if (!s->assigned_ip) {
@@ -580,10 +596,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                         s->last_server_fd = fd;
                     }
                     // Register in O(1) fast-path cache
-                    {
-                        std::lock_guard<std::mutex> ep_lock(g_endpoint_mu);
-                        g_endpoint_cache[make_endpoint_key(ip_num, caddr.sin_port)] = s;
-                    }
+                    update_endpoint_cache(make_endpoint_key(ip_num, caddr.sin_port), s);
                     sendto(fd, resp.data(), resp.size(), 0, (struct sockaddr*)&caddr, sizeof(caddr));
                     std::cout << "[HS] Client " << inet_ntoa(caddr.sin_addr) << " assigned " << IpPool::to_string(s->assigned_ip) << "\n";
                     
@@ -630,8 +643,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                 if (mask_unmask_header(pkt_data + 12, 16, s->mask_key, hdr_iv, unmasked_hdr)) {
                     if (std::memcmp(unmasked_hdr, &s->key_id_raw, 8) == 0 && std::memcmp(unmasked_hdr + 12, VER_MAGIC.data(), 4) == 0) {
                         matched_sess = s;
-                        std::lock_guard<std::mutex> ep_lock(g_endpoint_mu);
-                        g_endpoint_cache[ep_key] = s;
+                        update_endpoint_cache(ep_key, s);
                         break;
                     }
                 }

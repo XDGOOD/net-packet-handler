@@ -15,6 +15,7 @@
 #include <winsock2.h>
 #else
 #include <arpa/inet.h>
+#include <sys/stat.h>
 #endif
 
 // Helpers
@@ -238,7 +239,11 @@ void HandshakeServer::load_or_generate_key() {
         EVP_PKEY_get_raw_private_key(m_static_pkey, priv, &len);
         std::ofstream os(path, std::ios::binary);
         os.write((char*)priv, 32);
-        // TODO MED-3: chmod 0600 on server_key.bin
+        os.close();
+#ifndef _WIN32
+        // FIX MED-3: Restrict private key permissions to owner only (0600)
+        chmod(path.c_str(), 0600);
+#endif
     }
 }
 
@@ -246,12 +251,19 @@ std::vector<uint8_t> HandshakeServer::get_pubkey() const {
     return extract_x25519_pub(m_static_pkey);
 }
 
-void HandshakeServer::prune_timestamps() {
-    uint64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    if (now - m_last_prune_time > 60000) {
-        m_seen_timestamps.clear();
-        m_last_prune_time = now;
+// FIX Audit: Evict only timestamps older than 35,000 ms.
+// Since valid timestamps must be within 30s (now - ts <= 30000), any timestamp
+// older than 35s will be rejected by the timestamp validity check anyway.
+// Retaining them for 35s completely closes the replay attack window.
+void HandshakeServer::prune_timestamps(uint64_t now_ms) {
+    if (now_ms - m_last_prune_time < 5000) return; // run every 5 seconds
+    m_last_prune_time = now_ms;
+    for (auto it = m_seen_timestamps.begin(); it != m_seen_timestamps.end(); ) {
+        if (now_ms - it->second > 35000) {
+            it = m_seen_timestamps.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
@@ -298,7 +310,7 @@ bool HandshakeServer::process_init(const uint8_t* init, size_t len, uint64_t& ke
     if (now < ts || now - ts > 30000) return false; // 30 seconds
 
     std::lock_guard<std::mutex> lock(m_mutex);
-    prune_timestamps();
+    prune_timestamps(now);
     prune_pending(now); // FIX CRIT-5: clean stale pending states
 
     // FIX CRIT-5: Hard upper bounds on pre-auth state size.
@@ -308,7 +320,7 @@ bool HandshakeServer::process_init(const uint8_t* init, size_t len, uint64_t& ke
     if (m_seen_timestamps.size() >= MAX_SEEN_TIMESTAMPS) return false;
 
     if (m_seen_timestamps.find(ts) != m_seen_timestamps.end()) return false;
-    m_seen_timestamps.insert(ts);
+    m_seen_timestamps[ts] = now;
 
     // Free any stale ephemeral key from a previous abandoned handshake for this key_id
     auto existing = m_pending_clients.find(key_id_out);

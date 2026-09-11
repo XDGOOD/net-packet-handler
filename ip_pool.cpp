@@ -19,7 +19,15 @@ IpPool::IpPool(const std::string& network_cidr) {
     }
 
     std::string ip_str = network_cidr.substr(0, slash_pos);
-    int prefix = std::stoi(network_cidr.substr(slash_pos + 1));
+    int prefix = 0;
+    try {
+        prefix = std::stoi(network_cidr.substr(slash_pos + 1));
+    } catch (...) {
+        throw std::invalid_argument("Invalid CIDR prefix");
+    }
+    if (prefix < 16 || prefix > 30) {
+        throw std::invalid_argument("CIDR prefix must be between /16 and /30 for VPN IP pool");
+    }
 
     uint32_t ip;
 #ifdef _WIN32
@@ -35,7 +43,7 @@ IpPool::IpPool(const std::string& network_cidr) {
     ip = ntohl(addr.s_addr);
 #endif
 
-    uint32_t mask = ~((1ULL << (32 - prefix)) - 1);
+    uint32_t mask = (prefix == 32) ? 0xFFFFFFFFu : (~0u << (32 - prefix));
     net_base_ = ip & mask;
     net_mask_ = mask;
 

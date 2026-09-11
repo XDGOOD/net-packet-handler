@@ -67,7 +67,11 @@ private:
     EVP_PKEY* m_static_pkey;
 
     std::mutex m_mutex;
-    std::unordered_set<uint64_t> m_seen_timestamps;
+    // FIX Audit: Map timestamp -> received_time_ms.
+    // Previously, prune_timestamps() called m_seen_timestamps.clear() every 60s,
+    // which created a vulnerability window where replayed HANDSHAKE_INIT packets
+    // within the 30-second window were accepted again after the wipe.
+    std::unordered_map<uint64_t, uint64_t> m_seen_timestamps;
     uint64_t m_last_prune_time;
 
     struct ClientState {
@@ -77,7 +81,7 @@ private:
     std::unordered_map<uint64_t, ClientState> m_pending_clients;
 
     void load_or_generate_key();
-    void prune_timestamps();
+    void prune_timestamps(uint64_t now_ms);
     // FIX CRIT-5: Evict stale pending handshake states that exceeded TTL.
     // Without this, m_pending_clients grows unbounded if clients never
     // complete the handshake (e.g. attacker sends INIT but never reads RESP).

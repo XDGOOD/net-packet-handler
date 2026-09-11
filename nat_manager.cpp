@@ -10,12 +10,27 @@ NatManager::NatManager(const std::string& tun_iface,
                        const std::string& subnet)
     : tun_iface_(tun_iface), out_iface_(out_iface), subnet_(subnet) {}
 
+static bool is_safe_shell_param(const std::string& str) {
+    if (str.empty() || str.length() > 64) return false;
+    for (char c : str) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-' && c != '.' && c != '/') {
+            return false;
+        }
+    }
+    return true;
+}
+
 int NatManager::run_cmd(const std::string& cmd) {
     std::cout << "Executing: " << cmd << std::endl;
     return std::system(cmd.c_str());
 }
 
 bool NatManager::setup() {
+    if (!is_safe_shell_param(tun_iface_) || !is_safe_shell_param(out_iface_) || !is_safe_shell_param(subnet_)) {
+        std::cerr << "[NatManager] ERROR: Dangerous characters detected in interface or subnet name\n";
+        return false;
+    }
+
     // 1. Enable IPv4 forwarding
     std::ofstream ip_forward("/proc/sys/net/ipv4/ip_forward");
     if (ip_forward.is_open()) {
