@@ -313,11 +313,35 @@ bool HandshakeServer::process_init(const uint8_t* init, size_t len, uint64_t& ke
     prune_timestamps(now);
     prune_pending(now); // FIX CRIT-5: clean stale pending states
 
-    // FIX CRIT-5: Hard upper bounds on pre-auth state size.
-    // If under sustained attack, we sacrifice new legitimate handshakes
-    // rather than allowing OOM — this is the correct trade-off per §1.
-    if (m_pending_clients.size() >= MAX_PENDING_CLIENTS) return false;
-    if (m_seen_timestamps.size() >= MAX_SEEN_TIMESTAMPS) return false;
+    // FIX DoS Hardening: Instead of hard-rejecting when capacity is reached
+    // (which allows an attacker flooding 1024 dummy packets to permanently lock
+    // out legitimate users), evict the oldest pending entry (LRU eviction).
+    if (m_pending_clients.size() >= MAX_PENDING_CLIENTS) {
+        auto oldest_it = m_pending_clients.begin();
+        for (auto it = m_pending_clients.begin(); it != m_pending_clients.end(); ++it) {
+            if (it->second.timestamp < oldest_it->second.timestamp) {
+                oldest_it = it;
+            }
+        }
+        if (oldest_it != m_pending_clients.end()) {
+            if (oldest_it->second.client_ephemeral_pkey) {
+                EVP_PKEY_free(oldest_it->second.client_ephemeral_pkey);
+            }
+            m_pending_clients.erase(oldest_it);
+        }
+    }
+
+    if (m_seen_timestamps.size() >= MAX_SEEN_TIMESTAMPS) {
+        auto oldest_ts = m_seen_timestamps.begin();
+        for (auto it = m_seen_timestamps.begin(); it != m_seen_timestamps.end(); ++it) {
+            if (it->second < oldest_ts->second) {
+                oldest_ts = it;
+            }
+        }
+        if (oldest_ts != m_seen_timestamps.end()) {
+            m_seen_timestamps.erase(oldest_ts);
+        }
+    }
 
     if (m_seen_timestamps.find(ts) != m_seen_timestamps.end()) return false;
     m_seen_timestamps[ts] = now;

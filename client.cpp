@@ -24,6 +24,7 @@
 #include "port_hopper.h"
 #include "session_resumption.h"
 #include "network_security.h"
+#include "backpressure.h"
 #include <optional>
 #include <memory>
 #include <poll.h>
@@ -374,6 +375,7 @@ int main(int argc, char* argv[]) {
     KillSwitch kill_switch;
     DnsLeakProtector dns_shield;
     TransportFailureDetector transport_detector;
+    BackpressureController backpressure;
 
     if (enable_kill_switch) {
         kill_switch.enable(s_host, (uint16_t)s_port, port_count, "aegs0");
@@ -387,10 +389,12 @@ int main(int argc, char* argv[]) {
         if (poll_ret < 0) break;
 
         if (chaff_engine.should_send_chaff()) {
-            std::vector<uint8_t> chaff_pkt = chaff_engine.build_chaff_packet(raw_kid, mask_key, session_keys.send_key, client_tx_seq);
-            if (!chaff_pkt.empty()) {
+            static thread_local uint8_t chaff_scratch[512];
+            size_t chaff_len = chaff_engine.build_chaff_packet(raw_kid, mask_key, session_keys.send_key,
+                                                               client_tx_seq, chaff_scratch, sizeof(chaff_scratch));
+            if (chaff_len > 0) {
                 s_addr.sin_port = htons(hopper.current_port(session_keys.send_key));
-                sendto(fd, chaff_pkt.data(), chaff_pkt.size(), 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
+                sendto(fd, chaff_scratch, chaff_len, 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
             }
         }
 
@@ -512,52 +516,59 @@ int main(int argc, char* argv[]) {
 
         // TUN fd readable
         if (use_tun && tun && (pfds[1].revents & POLLIN)) {
-            ssize_t len = tun->read_packet(buf.data(), buf.size());
-            if (len > 0) {
-                size_t pad_len = shaper.semantic_pad((size_t)len);
-                size_t frame_len = FRAME_HDR + (size_t)len + pad_len;
-                if (frame_len + TAG_LEN > pbuf.size()) { pad_len = 0; frame_len = FRAME_HDR + (size_t)len; }
-                if (frame_len + TAG_LEN > pbuf.size()) continue;
+            if (!backpressure.should_pause_tun()) {
+                ssize_t len = tun->read_packet(buf.data(), buf.size());
+                if (len > 0) {
+                    size_t pad_len = shaper.semantic_pad((size_t)len);
+                    size_t frame_len = FRAME_HDR + (size_t)len + pad_len;
+                    if (frame_len + TAG_LEN > pbuf.size()) { pad_len = 0; frame_len = FRAME_HDR + (size_t)len; }
+                    if (frame_len + TAG_LEN > pbuf.size()) continue;
 
-                uint16_t plen_be = htons((uint16_t)len);
-                std::memcpy(pbuf.data(), &plen_be, 2);
-                std::memcpy(pbuf.data() + 2, buf.data(), len);
-                if (pad_len > 0) TrafficShaper::fill_random_padding(pbuf.data() + 2 + len, pad_len);
+                    uint16_t plen_be = htons((uint16_t)len);
+                    std::memcpy(pbuf.data(), &plen_be, 2);
+                    std::memcpy(pbuf.data() + 2, buf.data(), len);
+                    if (pad_len > 0) TrafficShaper::fill_random_padding(pbuf.data() + 2 + len, pad_len);
 
-                uint8_t aead_nonce[12] = {0};
-                client_tx_seq++;
-                std::memcpy(aead_nonce, &client_tx_seq, sizeof(uint64_t));
-                RAND_bytes(aead_nonce + 8, 4);
+                    uint8_t aead_nonce[12] = {0};
+                    client_tx_seq++;
+                    std::memcpy(aead_nonce, &client_tx_seq, sizeof(uint64_t));
+                    RAND_bytes(aead_nonce + 8, 4);
 
-                uint16_t junk_len = generate_junk_len();
+                    uint16_t junk_len = generate_junk_len();
 
-                uint8_t hdr_plain[16];
-                std::memcpy(hdr_plain, raw_kid, 8);
-                hdr_plain[8] = (junk_len >> 8) & 0xFF;
-                hdr_plain[9] = junk_len & 0xFF;
-                hdr_plain[10] = 0; hdr_plain[11] = 0;
-                std::memcpy(hdr_plain + 12, VER_MAGIC.data(), 4);
+                    uint8_t hdr_plain[16];
+                    std::memcpy(hdr_plain, raw_kid, 8);
+                    hdr_plain[8] = (junk_len >> 8) & 0xFF;
+                    hdr_plain[9] = junk_len & 0xFF;
+                    hdr_plain[10] = 0; hdr_plain[11] = 0;
+                    std::memcpy(hdr_plain + 12, VER_MAGIC.data(), 4);
 
-                uint8_t hdr_iv[12]; RAND_bytes(hdr_iv, 12);
-                uint8_t masked_hdr[16];
-                if (!mask_unmask_header(hdr_plain, 16, mask_key, hdr_iv, masked_hdr)) continue;
+                    uint8_t hdr_iv[12]; RAND_bytes(hdr_iv, 12);
+                    uint8_t masked_hdr[16];
+                    if (!mask_unmask_header(hdr_plain, 16, mask_key, hdr_iv, masked_hdr)) continue;
 
-                static thread_local std::vector<uint8_t> out_buf(BUFFER_SIZE);
-                size_t out_len = 0;
-                std::memcpy(out_buf.data(), hdr_iv, 12); out_len += 12;
-                std::memcpy(out_buf.data() + out_len, masked_hdr, 16); out_len += 16;
-                if (junk_len > 0) { RAND_bytes(out_buf.data() + out_len, (int)junk_len); out_len += junk_len; }
-                size_t aead_offset = out_len;
-                std::memcpy(out_buf.data() + out_len, aead_nonce, 12); out_len += 12;
+                    static thread_local std::vector<uint8_t> out_buf(BUFFER_SIZE);
+                    size_t out_len = 0;
+                    std::memcpy(out_buf.data(), hdr_iv, 12); out_len += 12;
+                    std::memcpy(out_buf.data() + out_len, masked_hdr, 16); out_len += 16;
+                    if (junk_len > 0) { RAND_bytes(out_buf.data() + out_len, (int)junk_len); out_len += junk_len; }
+                    size_t aead_offset = out_len;
+                    std::memcpy(out_buf.data() + out_len, aead_nonce, 12); out_len += 12;
 
-                size_t elen = 0;
-                // FIX Blocker 3: Authenticate outer header as AAD in AEAD Poly1305
-                if (!chacha20_poly1305_encrypt(pbuf.data(), frame_len, session_keys.send_key, aead_nonce, cbuf.data(), elen, out_buf.data(), aead_offset)) continue;
-                std::memcpy(out_buf.data() + out_len, cbuf.data(), elen); out_len += elen;
+                    size_t elen = 0;
+                    // FIX Blocker 3: Authenticate outer header as AAD in AEAD Poly1305
+                    if (!chacha20_poly1305_encrypt(pbuf.data(), frame_len, session_keys.send_key, aead_nonce, cbuf.data(), elen, out_buf.data(), aead_offset)) continue;
+                    std::memcpy(out_buf.data() + out_len, cbuf.data(), elen); out_len += elen;
 
-                s_addr.sin_port = htons(hopper.current_port(session_keys.send_key));
-                sendto(fd, out_buf.data(), out_len, 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
-                chaff_engine.mark_real_packet();
+                    s_addr.sin_port = htons(hopper.current_port(session_keys.send_key));
+                    ssize_t sret = sendto(fd, out_buf.data(), out_len, 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
+                    if (sret < 0) {
+                        backpressure.record_egress_failure(errno);
+                    } else {
+                        backpressure.record_egress_success();
+                    }
+                    chaff_engine.mark_real_packet();
+                }
             }
         }
     }

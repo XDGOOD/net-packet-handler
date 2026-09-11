@@ -42,6 +42,7 @@
 #include "session_table.h"
 #include "aegs_config.h"
 #include "network_security.h"
+#include "backpressure.h"
 
 #ifndef SO_REUSEPORT
 #define SO_REUSEPORT 15
@@ -275,6 +276,39 @@ const int ban_levels[] = {0, 30, 300, 3600};
 std::mutex security_mu;
 std::mutex tun_write_mu;
 
+// FIX Production DoS: Pre-crypto handshake rate limiter per IP
+struct HandshakeRateRecord {
+    double window_start = 0;
+    int count = 0;
+};
+std::unordered_map<uint32_t, HandshakeRateRecord> g_hs_rate_limit;
+std::mutex g_hs_rate_mu;
+const int MAX_HANDSHAKES_PER_SEC_PER_IP = 10;
+const size_t MAX_HS_RATE_LIMIT_ENTRIES = 4096;
+
+static bool check_handshake_rate_limit(uint32_t ip_num, double now) {
+    std::lock_guard<std::mutex> lock(g_hs_rate_mu);
+    auto it = g_hs_rate_limit.find(ip_num);
+    if (it == g_hs_rate_limit.end()) {
+        if (g_hs_rate_limit.size() >= MAX_HS_RATE_LIMIT_ENTRIES) {
+            auto oldest = g_hs_rate_limit.begin();
+            for (auto e = g_hs_rate_limit.begin(); e != g_hs_rate_limit.end(); ++e) {
+                if (e->second.window_start < oldest->second.window_start) oldest = e;
+            }
+            if (oldest != g_hs_rate_limit.end()) g_hs_rate_limit.erase(oldest);
+        }
+        g_hs_rate_limit[ip_num] = {now, 1};
+        return true;
+    }
+    if (now - it->second.window_start >= 1.0) {
+        it->second.window_start = now;
+        it->second.count = 1;
+        return true;
+    }
+    it->second.count++;
+    return (it->second.count <= MAX_HANDSHAKES_PER_SEC_PER_IP);
+}
+
 // Signal handling & clean shutdown
 static std::atomic<bool> g_running{true};
 static void handle_signal(int sig) {
@@ -310,6 +344,12 @@ void cleanup_maps(double now, IpPool& ip_pool) {
     }
     for (auto it = failed_attempts.begin(); it != failed_attempts.end(); ) {
         if (now - it->second.last_seen > FAIL_IDLE_TTL) it = failed_attempts.erase(it); else ++it;
+    }
+    {
+        std::lock_guard<std::mutex> hs_lock(g_hs_rate_mu);
+        for (auto it = g_hs_rate_limit.begin(); it != g_hs_rate_limit.end(); ) {
+            if (now - it->second.window_start > 10.0) it = g_hs_rate_limit.erase(it); else ++it;
+        }
     }
     for (auto it = sessions.begin(); it != sessions.end(); ) {
         Session* s = it->second;
@@ -412,6 +452,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
     std::unordered_set<int> server_fd_set;
     std::unordered_map<int, uint16_t> fd_to_port;
     PortHopper hopper(ports.empty() ? 50001 : ports.front(), ports.size(), 30);
+    BackpressureController backpressure(64);
 
     for (uint16_t port : ports) {
         int sfd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -558,57 +599,72 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
             return;
         }
 
-        if (pkt_data[0] == 0x01 && (size_t)len >= 72) {
+        if (pkt_data[0] == 0x01) {
+            // FIX Production DoS: Reject undersized handshake packets immediately
+            if ((size_t)len < 72) {
+                record_fail(fd, caddr, pkt_data, (size_t)len, ip_num, now, 1.0);
+                return;
+            }
+            // FIX Production DoS: Pre-crypto rate limiting per IP
+            if (!check_handshake_rate_limit(ip_num, now)) {
+                record_fail(fd, caddr, pkt_data, (size_t)len, ip_num, now, 0.5);
+                return;
+            }
             uint64_t key_id_out = 0;
-            if (hs_server.process_init(pkt_data, len, key_id_out)) {
-                char kid_hex[17];
-                for (int j = 0; j < 8; j++) sprintf(&kid_hex[j*2], "%02x", ((uint8_t*)&key_id_out)[j]);
-                kid_hex[16] = 0;
-                Session* s = nullptr;
+            if (!hs_server.process_init(pkt_data, len, key_id_out)) {
+                // Invalid KeyID, timestamp or forged MAC: penalize immediately
+                record_fail(fd, caddr, pkt_data, (size_t)len, ip_num, now, 1.0);
+                return;
+            }
+            char kid_hex[17];
+            for (int j = 0; j < 8; j++) sprintf(&kid_hex[j*2], "%02x", ((uint8_t*)&key_id_out)[j]);
+            kid_hex[16] = 0;
+            Session* s = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(sessions_mu);
+                auto sit = sessions.find(kid_hex);
+                if (sit != sessions.end()) s = sit->second;
+            }
+            if (s) {
+                auto maybe_ip = ip_pool.allocate();
+                if (!maybe_ip) { std::cerr << "IP pool exhausted\n"; return; }
                 {
                     std::lock_guard<std::mutex> lk(sessions_mu);
-                    auto sit = sessions.find(kid_hex);
-                    if (sit != sessions.end()) s = sit->second;
+                    if (s->assigned_ip) {
+                        ip_pool.release(s->assigned_ip);
+                        ip_to_session.erase(s->assigned_ip);
+                    }
+                    s->assigned_ip = *maybe_ip;
+                    ip_to_session[s->assigned_ip] = s;
                 }
-                if (s) {
-                    auto maybe_ip = ip_pool.allocate();
-                    if (!maybe_ip) { std::cerr << "IP pool exhausted\n"; return; }
-                    {
-                        std::lock_guard<std::mutex> lk(sessions_mu);
-                        if (s->assigned_ip) {
-                            ip_pool.release(s->assigned_ip);
-                            ip_to_session.erase(s->assigned_ip);
-                        }
-                        s->assigned_ip = *maybe_ip;
-                        ip_to_session[s->assigned_ip] = s;
-                    }
-                    
-                    SessionKeys sk;
-                    auto resp = hs_server.build_resp(key_id_out, s->assigned_ip, 1400, sk);
-                    {
-                        std::lock_guard<std::mutex> slk(s->mu);
-                        s->session_keys = sk;
-                        s->session_id = sk.session_id;
-                        s->client_addr = caddr;
-                        s->has_client = true;
-                        s->v3_handshake_done = true;
-                        s->last_activity = now;
-                        s->last_server_fd = fd;
-                    }
-                    // Register in O(1) fast-path cache
-                    update_endpoint_cache(make_endpoint_key(ip_num, caddr.sin_port), s);
-                    sendto(fd, resp.data(), resp.size(), 0, (struct sockaddr*)&caddr, sizeof(caddr));
-                    std::cout << "[HS] Client " << inet_ntoa(caddr.sin_addr) << " assigned " << IpPool::to_string(s->assigned_ip) << "\n";
-                    
-                    ResumptionToken rtok;
-                    if (g_resumption.issue(s->session_id, s->assigned_ip, s->master_key, rtok)) {
-                        uint8_t rtok_pkt[97];
-                        rtok_pkt[0] = 0x03; // RESUMPTION_TOKEN
-                        memcpy(rtok_pkt + 1, &rtok, 96);
-                        sendto(fd, rtok_pkt, 97, 0, (struct sockaddr*)&caddr, sizeof(caddr));
-                        std::cout << "[HS] Resumption token issued for " << inet_ntoa(caddr.sin_addr) << "\n";
-                    }
+                
+                SessionKeys sk;
+                auto resp = hs_server.build_resp(key_id_out, s->assigned_ip, 1400, sk);
+                {
+                    std::lock_guard<std::mutex> slk(s->mu);
+                    s->session_keys = sk;
+                    s->session_id = sk.session_id;
+                    s->client_addr = caddr;
+                    s->has_client = true;
+                    s->v3_handshake_done = true;
+                    s->last_activity = now;
+                    s->last_server_fd = fd;
                 }
+                // Register in O(1) fast-path cache
+                update_endpoint_cache(make_endpoint_key(ip_num, caddr.sin_port), s);
+                sendto(fd, resp.data(), resp.size(), 0, (struct sockaddr*)&caddr, sizeof(caddr));
+                std::cout << "[HS] Client " << inet_ntoa(caddr.sin_addr) << " assigned " << IpPool::to_string(s->assigned_ip) << "\n";
+                
+                ResumptionToken rtok;
+                if (g_resumption.issue(s->session_id, s->assigned_ip, s->master_key, rtok)) {
+                    uint8_t rtok_pkt[97];
+                    rtok_pkt[0] = 0x03; // RESUMPTION_TOKEN
+                    memcpy(rtok_pkt + 1, &rtok, 96);
+                    sendto(fd, rtok_pkt, 97, 0, (struct sockaddr*)&caddr, sizeof(caddr));
+                    std::cout << "[HS] Resumption token issued for " << inet_ntoa(caddr.sin_addr) << "\n";
+                }
+            } else {
+                record_fail(fd, caddr, pkt_data, (size_t)len, ip_num, now, 1.0);
             }
             return;
         }
@@ -775,7 +831,11 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                 }
 #endif
             } else if (fd == tun_fd) {
-                while (true) {
+                if (backpressure.should_pause_tun()) {
+                    continue; // Egress congested: defer reading from TUN to trigger upstream TCP flow control
+                }
+                size_t max_batch = backpressure.max_tun_batch();
+                for (size_t batch = 0; batch < max_batch; ++batch) {
                     ssize_t n = tun.read_packet(buffer.data(), buffer.size());
                     if (n < 0) {
                         break; // EAGAIN / EWOULDBLOCK
@@ -851,7 +911,13 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                         // FIX Blocker 3: Authenticate outer header as AAD in AEAD Poly1305
                         if (chacha20_poly1305_encrypt(dec_buf.data(), frame_len, enc_key, aead_nonce, enc_buf.data(), enc_len, out_buf.data(), aead_offset)) {
                             std::memcpy(out_buf.data() + out_len, enc_buf.data(), enc_len); out_len += enc_len;
-                            sendto(send_fd, out_buf.data(), out_len, 0, (struct sockaddr*)&client_addr, sizeof(client_addr));
+                            ssize_t sret = sendto(send_fd, out_buf.data(), out_len, 0, (struct sockaddr*)&client_addr, sizeof(client_addr));
+                            if (sret < 0) {
+                                backpressure.record_egress_failure(errno);
+                                break; // Stop draining TUN immediately when socket buffers are saturated
+                            } else {
+                                backpressure.record_egress_success();
+                            }
                         }
                     }
                 }
