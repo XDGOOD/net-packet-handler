@@ -255,6 +255,8 @@ bool set_nonblocking(int fd) {
 // Global BlackholeResponder for anti active-probing
 BlackholeResponder g_blackhole;
 ResumptionManager g_resumption;
+// FIX Client Isolation: default ON for multi-tenant security (set AEGS_CLIENT_ISOLATION=0 to disable)
+static bool g_client_isolation = true;
 
 // Blackhole-enhanced probing fallback: generates varied QUIC-like responses
 void send_probing_fallback(int fd, const struct sockaddr_in& caddr,
@@ -440,13 +442,17 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                 // FIX O(1) Resumption Scaling: Look up session directly by KeyID in token
                 auto sit = sessions.find(kid_hex);
                 if (sit != sessions.end()) {
-                    if (g_resumption.verify(rtok, sit->second->master_key, resumed_sid, resumed_ip)) {
-                        resumed_sess = sit->second;
-                    }
+                    resumed_sess = sit->second;
                 }
                 // NOTE: Legacy O(N) fallback loop removed.
                 // All tokens now include key_id for O(1) lookup. If key_id is missing
                 // or doesn't match, resumption simply fails (client must re-handshake).
+            }
+            // FIX Concurrency: Verify token OUTSIDE sessions_mu to avoid holding global lock during crypto
+            if (resumed_sess) {
+                if (!g_resumption.verify(rtok, resumed_sess->master_key, resumed_sid, resumed_ip)) {
+                    resumed_sess = nullptr; // Verification failed
+                }
             }
             if (resumed_sess) {
                 Session* s = resumed_sess;
@@ -775,6 +781,20 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                     }
                     if (!s) continue;
 
+                    // FIX Client Isolation: Drop inter-client traffic when isolation enabled
+                    // Source IP in TUN packet (bytes 12-15 in big-endian) — if it belongs to
+                    // another VPN client, drop to prevent lateral movement between tenants
+                    if (g_client_isolation && n >= 20) {
+                        uint32_t src_ip = (uint32_t(buffer[12]) << 24) | (uint32_t(buffer[13]) << 16)
+                                        | (uint32_t(buffer[14]) << 8)  |  uint32_t(buffer[15]);
+                        if (src_ip != dst_ip) {
+                            std::lock_guard<std::mutex> lk(sessions_mu);
+                            if (ip_to_session.find(src_ip) != ip_to_session.end()) {
+                                continue; // Drop: client-to-client traffic blocked
+                            }
+                        }
+                    }
+
                     struct sockaddr_in client_addr {};
                     int send_fd = -1;
                     uint8_t enc_key[32];
@@ -862,6 +882,7 @@ int main() {
     sigaction(SIGTERM, &sa, nullptr);
     signal(SIGPIPE, SIG_IGN);
     AegsConfig cfg = AegsConfig::from_env();
+    g_client_isolation = cfg.client_isolation;
     sqlite3* db;
     if (sqlite3_open(cfg.db_path.c_str(), &db) == SQLITE_OK) {
         sqlite3_stmt* stmt;

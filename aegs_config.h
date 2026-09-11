@@ -41,6 +41,7 @@ struct AegsConfig {
     double cleanup_interval     = 30.0;
     int    worker_threads       = 0;
     int    recv_batch_size      = 32;
+    bool   client_isolation     = true;            // AEGS_CLIENT_ISOLATION=0 to allow inter-client
 
     // Convenience accessor - alias for tun4_cidr (matches spec field tun_addr)
     const std::string& tun_addr() const noexcept { return tun4_cidr; }
@@ -64,6 +65,7 @@ struct AegsConfig {
         c.db_path          = gs("AEGS_DB_PATH",                     "/app/data/aegis.db");
         c.key_path         = gs("AEGS_KEY_PATH",                    "server_key.bin");
         c.session_idle_timeout = (double)gi("AEGS_SESSION_TIMEOUT", 180);
+        c.client_isolation     = gb("AEGS_CLIENT_ISOLATION",          true);
 
         if (c.port_count < 1)  c.port_count = 1;
         if (c.port_count > 64) c.port_count = 64;

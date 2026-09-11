@@ -27,7 +27,11 @@ static_assert(sizeof(ResumptionToken) == 96, "ResumptionToken size mismatch");
 
 class ResumptionManager {
 public:
-    ResumptionManager() = default;
+    ResumptionManager() {
+        // Generate per-boot secret: tokens from previous server instances
+        // automatically fail verification even if still within TTL
+        RAND_bytes(boot_secret_, 32);
+    }
 
     // Issue a resumption token after successful handshake
     // Returns false if crypto fails
@@ -145,6 +149,7 @@ public:
 
 private:
     std::mutex mu_;
+    uint8_t boot_secret_[32]{};
     std::unordered_map<std::string, uint64_t> used_nonces_;
     uint64_t last_prune_ms_ = 0;
 
@@ -165,16 +170,19 @@ private:
             std::chrono::system_clock::now().time_since_epoch()).count();
     }
 
-    static bool derive_resumption_key(const uint8_t master_key[32], uint8_t out[32]) {
+    bool derive_resumption_key(const uint8_t master_key[32], uint8_t out[32]) const {
         EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
         if (!ctx) return false;
         static const unsigned char info[] = "aegs-v4-resumption-key";
-        static const unsigned char salt[] = "aegis-v2-salt";
+        // Combine static salt with per-boot secret for boot-specific invalidation
+        unsigned char salt[45]; // 13 ("aegis-v2-salt") + 32 (boot_secret_)
+        std::memcpy(salt, "aegis-v2-salt", 13);
+        std::memcpy(salt + 13, boot_secret_, 32);
         size_t olen = 32;
         bool ok = (
             EVP_PKEY_derive_init(ctx) > 0 &&
             EVP_PKEY_CTX_set_hkdf_md(ctx, EVP_sha256()) > 0 &&
-            EVP_PKEY_CTX_set1_hkdf_salt(ctx, salt, sizeof(salt)-1) > 0 &&
+            EVP_PKEY_CTX_set1_hkdf_salt(ctx, salt, sizeof(salt)) > 0 &&
             EVP_PKEY_CTX_set1_hkdf_key(ctx, master_key, 32) > 0 &&
             EVP_PKEY_CTX_add1_hkdf_info(ctx, info, sizeof(info)-1) > 0 &&
             EVP_PKEY_derive(ctx, out, &olen) > 0

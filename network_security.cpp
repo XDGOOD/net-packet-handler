@@ -187,10 +187,38 @@ bool KillSwitch::enable(const std::string& server_ip,
     applied_cleanup_commands_.push_back("iptables -X " + chain);
 
     std::cout << "[KillSwitch] Activating hardware-level firewall isolation on " << tun_iface_ << "...\n";
+    std::vector<std::string> applied_rules; // Track successfully applied rules for rollback
     for (const auto& rule : rules) {
         int ret = execute_command(rule + " 2>/dev/null");
         if (ret != 0) {
-            std::cerr << "[KillSwitch] Warning: command failed (exit code " << ret << "): " << rule << "\n";
+            std::cerr << "[KillSwitch] FATAL: mandatory rule failed (exit code " << ret << "): " << rule << "\n";
+            // Rollback all successfully applied rules in reverse order
+            std::cerr << "[KillSwitch] Rolling back " << applied_rules.size() << " successfully applied rules...\n";
+            for (auto rit = applied_rules.rbegin(); rit != applied_rules.rend(); ++rit) {
+                execute_command(*rit + " 2>/dev/null");
+            }
+            // Also run full cleanup commands to ensure clean state
+            for (const auto& cmd : applied_cleanup_commands_) {
+                execute_command(cmd + " 2>/dev/null");
+            }
+            applied_cleanup_commands_.clear();
+            active_ = false;
+            std::cerr << "[KillSwitch] FAIL-CLOSED: activation aborted, no partial rules remain.\n";
+            return false;
+        }
+        // Build reverse command for rollback: replace -A with -D and -I with -D
+        std::string reverse = rule;
+        auto pos_A = reverse.find(" -A ");
+        if (pos_A != std::string::npos) {
+            reverse.replace(pos_A, 4, " -D ");
+        }
+        auto pos_I = reverse.find(" -I ");
+        if (pos_I != std::string::npos) {
+            reverse.replace(pos_I, 4, " -D ");
+        }
+        // Skip chain creation commands (-N) for reverse — handled by cleanup
+        if (rule.find(" -N ") == std::string::npos) {
+            applied_rules.push_back(reverse);
         }
     }
 
@@ -202,11 +230,20 @@ bool KillSwitch::enable(const std::string& server_ip,
         applied_cleanup_commands_.push_back("ip6tables -X " + chain6);
 
         auto v6_rules = generate_ipv6_rules();
+        bool v6_ok = true;
         for (const auto& r : v6_rules) {
-            execute_command(r + " 2>/dev/null");
+            if (execute_command(r + " 2>/dev/null") != 0) {
+                std::cerr << "[KillSwitch] Warning: IPv6 rule failed: " << r << "\n";
+                v6_ok = false;
+            }
         }
-        ipv6_blocked_ = true;
-        std::cout << "[KillSwitch] IPv6 leak protection active: dedicated " << chain6 << " chain\n";
+        if (v6_ok) {
+            ipv6_blocked_ = true;
+            std::cout << "[KillSwitch] IPv6 leak protection active: dedicated " << chain6 << " chain\n";
+        } else {
+            // IPv6 failure is non-fatal but logged prominently
+            std::cerr << "[KillSwitch] WARNING: IPv6 lockdown incomplete, some IPv6 leaks may occur\n";
+        }
     } else {
         std::cout << "[KillSwitch] IPv6 not available or ip6tables not present, skipping IPv6 lockdown.\n";
     }
