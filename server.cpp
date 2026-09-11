@@ -443,15 +443,10 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                     if (g_resumption.verify(rtok, sit->second->master_key, resumed_sid, resumed_ip)) {
                         resumed_sess = sit->second;
                     }
-                } else {
-                    // Safe fallback if key_id is absent (e.g. legacy test token)
-                    for (auto& kv : sessions) {
-                        if (g_resumption.verify(rtok, kv.second->master_key, resumed_sid, resumed_ip)) {
-                            resumed_sess = kv.second;
-                            break;
-                        }
-                    }
                 }
+                // NOTE: Legacy O(N) fallback loop removed.
+                // All tokens now include key_id for O(1) lookup. If key_id is missing
+                // or doesn't match, resumption simply fails (client must re-handshake).
             }
             if (resumed_sess) {
                 Session* s = resumed_sess;
@@ -463,9 +458,22 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                     s->last_server_fd = fd;
                     s->session_id = resumed_sid;
 
-                    // FIX Blocker 2: Restore full cryptographic state and forward-secret session keys
-                    hkdf_expand(s->master_key, 32, "aegs-c2s", s->session_keys.recv_key, 32);
-                    hkdf_expand(s->master_key, 32, "aegs-s2c", s->session_keys.send_key, 32);
+                    // FIX Blocker 2: Restore full cryptographic state and forward-secret session keys using per‑RESUME secret
+                    // Derive a per‑resume key from the token nonce to avoid nonce reuse across resumption.
+                    auto hex_encode = [](const uint8_t* data, size_t len) -> std::string {
+                        static const char* hexdigits = "0123456789abcdef";
+                        std::string out; out.reserve(len * 2);
+                        for (size_t i = 0; i < len; ++i) {
+                            out.push_back(hexdigits[data[i] >> 4]);
+                            out.push_back(hexdigits[data[i] & 0xF]);
+                        }
+                        return out;
+                    };
+                    std::string resume_info = "aegs-resume-" + hex_encode(rtok.nonce, 32);
+                    std::string recv_info = resume_info + "-s2c";
+                    std::string send_info = resume_info + "-c2s";
+                    hkdf_expand(s->master_key, 32, recv_info, s->session_keys.recv_key, 32);
+                    hkdf_expand(s->master_key, 32, send_info, s->session_keys.send_key, 32);
                     s->v3_handshake_done = true;
                     s->tx_seq = 0;
                     s->replay_filter = AntiReplayFilter();
@@ -665,8 +673,23 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
         if (dec_len < 2) return;
         uint16_t plen = (dec_buf[0] << 8) | dec_buf[1];
         if (plen > 0 && plen <= dec_len - 2) {
+            // FIX P0 TUN ACL: Verify inner packet source IP matches session's assigned IP
+            // Prevents tunnel users from spoofing arbitrary source addresses
+            const uint8_t* inner_pkt = dec_buf.data() + 2;
+            if (plen >= 20) { // Minimum IPv4 header size
+                uint8_t ip_version = (inner_pkt[0] >> 4) & 0xF;
+                if (ip_version == 4) {
+                    uint32_t inner_src_ip = (uint32_t(inner_pkt[12]) << 24) |
+                                           (uint32_t(inner_pkt[13]) << 16) |
+                                           (uint32_t(inner_pkt[14]) << 8)  |
+                                            uint32_t(inner_pkt[15]);
+                    if (s->assigned_ip != 0 && inner_src_ip != s->assigned_ip) {
+                        return; // Drop: source IP spoofing attempt
+                    }
+                }
+            }
             std::lock_guard<std::mutex> tlk(tun_write_mu);
-            tun.write_packet(dec_buf.data() + 2, plen);  
+            tun.write_packet(inner_pkt, plen);
         }
     };
 

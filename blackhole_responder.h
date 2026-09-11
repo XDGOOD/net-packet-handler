@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <mutex>
 
 class BlackholeResponder {
 public:
@@ -74,5 +75,6 @@ private:
         double window_start  = 0.0;  // Start timestamp of current window
     };
 
+    mutable std::mutex mu_;
     std::unordered_map<std::string, RateLimitEntry> rate_limits_;
 };

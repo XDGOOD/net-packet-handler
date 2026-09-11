@@ -18,6 +18,7 @@ bool BlackholeResponder::should_respond(const std::string& ip, double now,
                                         size_t estimated_bytes) {
     if (max_rate <= 0.0) max_rate = kDefaultMaxRate;
 
+    std::lock_guard<std::mutex> lock(mu_);
     auto it = rate_limits_.find(ip);
     if (it == rate_limits_.end()) {
         RateLimitEntry entry;
@@ -78,6 +79,7 @@ bool BlackholeResponder::should_respond(const std::string& ip, double now,
 }
 
 void BlackholeResponder::record_response(const std::string& ip, size_t bytes_sent) {
+    std::lock_guard<std::mutex> lock(mu_);
     auto it = rate_limits_.find(ip);
     if (it != rate_limits_.end()) {
         if (bytes_sent > 80) {

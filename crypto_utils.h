@@ -10,7 +10,7 @@
 
 // Protocol Constants
 inline const std::string VER_MAGIC = "AG2\x01";
-constexpr int PBKDF2_ITERATIONS = 200000;
+constexpr int AEGS_PBKDF2_ITERATIONS = 200000;
 constexpr size_t BUFFER_SIZE = 64000;
 constexpr size_t INTERNAL_BUF_SIZE = 65535;
 constexpr size_t TAG_LEN = 16;
