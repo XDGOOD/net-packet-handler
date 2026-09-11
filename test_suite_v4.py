@@ -422,9 +422,9 @@ class Pillar10_PortHopping(unittest.TestCase):
         self.assertNotIn(9999, valid_ports)
 
 class Pillar11_SessionResumption(unittest.TestCase):
-    """Pillar 11: Session resumption tokens — issue, verify, anti-replay."""
+    """Pillar 11: Session resumption tokens — issue, verify, anti-replay, and anti-malleability."""
     
-    def _issue_and_verify(self, master_key, session_id, ip):
+    def _issue_token(self, master_key, session_id, ip, key_id=b'\x00'*8):
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
         from cryptography.hazmat.primitives.kdf.hkdf import HKDF
         from cryptography.hazmat.primitives import hashes
@@ -439,29 +439,46 @@ class Pillar11_SessionResumption(unittest.TestCase):
         
         nonce_full = os.urandom(32)
         nonce_12 = nonce_full[:12]
+        reserved = b'\x00' * 8
+        aad = nonce_full + key_id + reserved
+        
         cipher = ChaCha20Poly1305(rkey)
-        ct_tag = cipher.encrypt(nonce_12, plain, None)
+        ct_tag = cipher.encrypt(nonce_12, plain, aad)
         ct = ct_tag[:32]
         tag = ct_tag[32:]
         
-        token = nonce_full + ct + tag + b'\x00' * 16
+        token = nonce_full + ct + tag + key_id + reserved
+        return token
+
+    def _verify_token(self, token, master_key):
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+        from cryptography.hazmat.primitives import hashes
+        import struct
         
-        nonce2 = token[:32]
-        ct2 = token[32:64]
-        tag2 = token[64:80]
+        self.assertEqual(len(token), 96)
+        nonce = token[:32]
+        ct = token[32:64]
+        tag = token[64:80]
+        key_id = token[80:88]
+        reserved = token[88:96]
         
-        hkdf2 = HKDF(algorithm=hashes.SHA256(), length=32,
-                      salt=b'aegis-v2-salt', info=b'aegs-v4-resumption-key')
-        rkey2 = hkdf2.derive(master_key)
-        cipher2 = ChaCha20Poly1305(rkey2)
+        aad = nonce + key_id + reserved
         
-        decrypted = cipher2.decrypt(nonce2[:12], ct2 + tag2, None)
+        hkdf = HKDF(algorithm=hashes.SHA256(), length=32,
+                     salt=b'aegis-v2-salt', info=b'aegs-v4-resumption-key')
+        rkey = hkdf.derive(master_key)
+        cipher = ChaCha20Poly1305(rkey)
         
+        decrypted = cipher.decrypt(nonce[:12], ct + tag, aad)
         sid_out = struct.unpack('<Q', decrypted[:8])[0]
         ip_out = struct.unpack('<I', decrypted[8:12])[0]
         exp_out = struct.unpack('<Q', decrypted[12:20])[0]
-        
         return sid_out, ip_out, exp_out
+
+    def _issue_and_verify(self, master_key, session_id, ip):
+        token = self._issue_token(master_key, session_id, ip)
+        return self._verify_token(token, master_key)
     
     def test_roundtrip(self):
         """Token can be issued and verified with correct key."""
@@ -474,36 +491,33 @@ class Pillar11_SessionResumption(unittest.TestCase):
     
     def test_wrong_key_fails(self):
         """Verify with wrong key must fail."""
-        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-        from cryptography.hazmat.primitives import hashes
-        import struct, time
-        
         key1 = os.urandom(32)
         key2 = os.urandom(32)
-        
-        hkdf = HKDF(algorithm=hashes.SHA256(), length=32,
-                     salt=b'aegis-v2-salt', info=b'aegs-v4-resumption-key')
-        rkey1 = hkdf.derive(key1)
-        
-        expiry = int(time.time() * 1000) + 180000
-        plain = struct.pack('<Q', 1) + struct.pack('<I', 2) + struct.pack('<Q', expiry) + b'\x00' * 12
-        nonce = os.urandom(32)
-        cipher = ChaCha20Poly1305(rkey1)
-        ct_tag = cipher.encrypt(nonce[:12], plain, None)
-        token = nonce + ct_tag[:32] + ct_tag[32:] + b'\x00' * 16
-        
-        hkdf2 = HKDF(algorithm=hashes.SHA256(), length=32,
-                      salt=b'aegis-v2-salt', info=b'aegs-v4-resumption-key')
-        rkey2 = hkdf2.derive(key2)
-        cipher2 = ChaCha20Poly1305(rkey2)
-        
+        token = self._issue_token(key1, 1, 2)
         with self.assertRaises(Exception):
-            cipher2.decrypt(token[:12], token[32:64] + token[64:80], None)
+            self._verify_token(token, key2)
+
+    def test_nonce_malleability_rejected(self):
+        """R-01 Fix: Tampering with non-IV nonce bytes (12..31) must cause Poly1305 rejection."""
+        key = os.urandom(32)
+        token = bytearray(self._issue_token(key, 1234, 5678))
+        # Tamper with byte 12 (outside 12-byte IV, inside 32-byte nonce)
+        token[12] ^= 0x01
+        with self.assertRaises(Exception):
+            self._verify_token(bytes(token), key)
+
+    def test_key_id_malleability_rejected(self):
+        """R-01 Fix: Tampering with key_id must cause Poly1305 rejection."""
+        key = os.urandom(32)
+        token = bytearray(self._issue_token(key, 1234, 5678, key_id=b'USER1234'))
+        # Tamper with key_id byte
+        token[80] ^= 0x01
+        with self.assertRaises(Exception):
+            self._verify_token(bytes(token), key)
     
     def test_token_size(self):
         """ResumptionToken must be exactly 96 bytes."""
-        self.assertEqual(32 + 32 + 16 + 16, 96)
+        self.assertEqual(32 + 32 + 16 + 8 + 8, 96)
 
 class Pillar12_NetworkSecurityAndLeakProtection(unittest.TestCase):
     """Pillar 12: Hardware Kill-Switch isolation, DNS Leak Shield, and TCP Fallback trigger."""
@@ -590,12 +604,23 @@ class Pillar12_NetworkSecurityAndLeakProtection(unittest.TestCase):
         self.assertEqual(len(accepts), 2)
 
     def test_killswitch_ipv6_leak_protection(self):
-        """KillSwitch blocks IPv6 traffic to prevent leaks outside tunnel."""
-        ipv6_rules = ["ip6tables -P OUTPUT DROP"]
-        cleanup_rules = ["ip6tables -P OUTPUT ACCEPT", "ip6tables -F OUTPUT"]
-        self.assertIn("ip6tables -P OUTPUT DROP", ipv6_rules)
-        self.assertIn("ip6tables -P OUTPUT ACCEPT", cleanup_rules)
-        self.assertIn("ip6tables -F OUTPUT", cleanup_rules)
+        """KillSwitch blocks IPv6 traffic safely via dedicated chain without foreign flush."""
+        chain6 = "AEGS_KILLSWITCH6"
+        ipv6_rules = [
+            f"ip6tables -N {chain6}",
+            f"ip6tables -A {chain6} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+            f"ip6tables -A {chain6} -o lo -j ACCEPT",
+            f"ip6tables -A {chain6} -j DROP",
+            f"ip6tables -I OUTPUT 1 -j {chain6}"
+        ]
+        cleanup_rules = [
+            f"ip6tables -D OUTPUT -j {chain6}",
+            f"ip6tables -F {chain6}",
+            f"ip6tables -X {chain6}"
+        ]
+        self.assertTrue(any("-j DROP" in r for r in ipv6_rules))
+        self.assertTrue(all("-F OUTPUT" not in r for r in cleanup_rules))
+        self.assertIn(f"ip6tables -X {chain6}", cleanup_rules)
 
     def test_dns_leak_shield_ipv6_isolation(self):
         """DNS shield rules block outbound IPv6 port 53 traffic."""
@@ -766,7 +791,7 @@ def main():
     print("\n[PILLAR 2] DPI SIGNATURE SCAN & SHANNON ENTROPY ON WIRE...")
     raw_kid = hashlib.sha256(token.encode()).digest()[:8]
     aead = ChaCha20Poly1305(payload_key)
-    sample_payload = secrets.token_bytes(148)
+    sample_payload = secrets.token_bytes(512)
     pad_len = 64
     plain = struct.pack(">H", len(sample_payload)) + sample_payload + secrets.token_bytes(pad_len)
     nonce = struct.pack("<Q", 1) + secrets.token_bytes(4)

@@ -93,6 +93,9 @@ private:
     std::string secure_dns_;
     std::string original_resolv_conf_;
     bool resolv_conf_backed_up_;
+    bool is_symlink_;
+    std::string symlink_target_;
+    bool used_resolvectl_;
     bool ipv6_dns_blocked_;
 
     int execute_command(const std::string& cmd) const noexcept;

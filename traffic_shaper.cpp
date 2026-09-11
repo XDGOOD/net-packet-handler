@@ -15,6 +15,7 @@
 
 #include <algorithm>    // std::clamp (C++17), std::max
 #include <chrono>
+#include <cstring>      // std::memcpy
 #include <limits>
 #include <random>
 

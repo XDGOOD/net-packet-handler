@@ -291,6 +291,98 @@ def enable_dns_shield():
         subprocess.run(["iptables", "-I", "OUTPUT", "1", "-j", "AEGS_DNS_SHIELD"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f"{Colors.GREEN}[DNS-Shield] Plaintext DNS blocked.{Colors.RESET}")
 
+# --- AEGS v3/v4 ECDH Handshake ---
+def perform_v3_handshake(sock: socket.socket, server_addr: tuple[str, int], raw_kid: bytes, master_key: bytes) -> tuple[bytes, bytes, int, str]:
+    """
+    Executes AEGS v3/v4 ECDH Mutual Authentication Handshake with Server:
+    - Generates Ephemeral X25519 Keypair
+    - Sends 72-byte HANDSHAKE_INIT with HMAC-SHA256 (MasterKey)
+    - Verifies 80-byte HANDSHAKE_RESP with transcript AAD
+    - Derives forward-secret session keys: c2s (send_key) and s2c (recv_key)
+    - Returns (c2s_key, s2c_key, session_id, assigned_ip_str)
+    """
+    from cryptography.hazmat.primitives.asymmetric import x25519
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes
+
+    client_priv = x25519.X25519PrivateKey.generate()
+    client_pub = client_priv.public_key().public_bytes_raw()
+
+    now_ms = int(time.time() * 1000)
+    # Type(1) + Reserved(7) + KeyID(8) + EphemeralPub(32) + Timestamp(8) = 56 bytes
+    init_body = b"\x01" + b"\x00" * 7 + raw_kid + client_pub + struct.pack(">Q", now_ms)
+    # HMAC-SHA256 truncated to 16 bytes
+    mac = hmac.new(master_key, init_body, hashlib.sha256).digest()[:16]
+    init_pkt = init_body + mac # 72 bytes
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        print(f"{Colors.CYAN}[*] Sending AEGS v4 HANDSHAKE_INIT (attempt {attempt+1}/{max_retries})...{Colors.RESET}")
+        sock.sendto(init_pkt, server_addr)
+        r, _, _ = select.select([sock], [], [], 3.0)
+        if not r:
+            continue
+
+        resp_data, resp_src = sock.recvfrom(2048)
+        if len(resp_data) < 80 or resp_data[0] != 0x02:
+            continue
+
+        # Process HANDSHAKE_RESP
+        session_id = struct.unpack("<Q", resp_data[8:16])[0]
+        server_pub_bytes = resp_data[16:48]
+        try:
+            server_pub = x25519.X25519PublicKey.from_public_bytes(server_pub_bytes)
+            shared_secret = client_priv.exchange(server_pub)
+        except Exception as e:
+            print(f"{Colors.RED}[!] Failed to compute X25519 shared secret: {e}{Colors.RESET}")
+            continue
+
+        # Derive forward-secret session keys with MasterKey as salt
+        def hkdf_derive_key(info: bytes) -> bytes:
+            hkdf = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=master_key,
+                info=info
+            )
+            return hkdf.derive(shared_secret)
+
+        send_key = hkdf_derive_key(b"aegs-c2s")
+        recv_key = hkdf_derive_key(b"aegs-s2c")
+        cfg_key = hkdf_derive_key(b"aegs-cfg")
+
+        # Decrypt config using cfg_key with AAD = resp_data[:48]
+        try:
+            cfg_aead = ChaCha20Poly1305(cfg_key)
+            cfg_plain = cfg_aead.decrypt(b"\x00" * 12, resp_data[48:80], resp_data[:48])
+        except Exception as e:
+            print(f"{Colors.RED}[!] Handshake response authentication failed (MITM detected): {e}{Colors.RESET}")
+            continue
+
+        assigned_ip_int = struct.unpack("<I", cfg_plain[:4])[0]
+        mtu = struct.unpack("<H", cfg_plain[4:6])[0]
+        assigned_ip = socket.inet_ntoa(struct.pack("<I", assigned_ip_int))
+
+        print(f"{Colors.GREEN}[OK] AEGS v4 Mutual Authentication Handshake Complete!{Colors.RESET}")
+        print(f"     - Session ID:  0x{session_id:016x}")
+        print(f"     - Assigned IP: {assigned_ip}")
+        print(f"     - MTU:         {mtu}")
+
+        # Receive optional ResumptionToken (packet 0x03) if server sends it
+        r_tok, _, _ = select.select([sock], [], [], 0.5)
+        if r_tok:
+            try:
+                tok_data, _ = sock.recvfrom(2048)
+                if len(tok_data) >= 97 and tok_data[0] == 0x03:
+                    print(f"{Colors.GREEN}[OK] ResumptionToken received (96 bytes).{Colors.RESET}")
+            except OSError:
+                pass
+
+        return send_key, recv_key, session_id, assigned_ip
+
+    raise RuntimeError(f"Handshake failed after {max_retries} attempts. Server did not respond or authentication rejected.")
+
 # --- Pure-Python Proxy Engine ---
 def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOCAL_PORT,
                      kill_switch: bool = False, dns_protect: bool = False,
@@ -307,8 +399,7 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
         sys.exit(1)
 
     raw_kid, kid_hex = compute_key_id(token)
-    master_key, mask_key, payload_key = derive_keys(token, kid_hex)
-    aead = ChaCha20Poly1305(payload_key)
+    master_key, mask_key, _ = derive_keys(token, kid_hex)
 
     # Resolve server address
     try:
@@ -344,6 +435,13 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
     print(f"{Colors.CYAN}[*] Sending State-Machine Pre-Bypass decoys (STUN / QUIC)...{Colors.RESET}")
     send_illusion_sequence(sock, server_addr)
     print(f"{Colors.GREEN}[OK] DPI State-Machine Pre-Bypass armed.{Colors.RESET}")
+
+    # Establish AEGS v3/v4 forward-secret session keys via ECDH handshake
+    print(f"{Colors.CYAN}[*] Initiating ECDH handshake with server...{Colors.RESET}")
+    send_key, recv_key, session_id, assigned_ip = perform_v3_handshake(sock, server_addr, raw_kid, master_key)
+    aead_send = ChaCha20Poly1305(send_key)
+    aead_recv = ChaCha20Poly1305(recv_key)
+
     print(f"{Colors.YELLOW}Proxying packets with Zero-DPI protection (Press Ctrl+C to stop)...{Colors.RESET}")
 
     wg_client_addr = None
@@ -391,9 +489,9 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
                     chaff_iv = secrets.token_bytes(12)
                     chaff_masked = mask_unmask_header(bytes(chaff_hdr), mask_key, chaff_iv)
                     chaff_aad = chaff_iv + chaff_masked
-                    chaff_ct = aead.encrypt(chaff_nonce, chaff_frame, chaff_aad)
+                    chaff_ct = aead_send.encrypt(chaff_nonce, chaff_frame, chaff_aad)
                     try:
-                        cur_port = compute_hopper_port(payload_key, DEFAULT_SERVER_PORT, port_count, hop_interval)
+                        cur_port = compute_hopper_port(send_key, DEFAULT_SERVER_PORT, port_count, hop_interval)
                         sock.sendto(chaff_iv + chaff_masked + chaff_nonce + chaff_ct, (server_ip, cur_port))
                     except OSError:
                         pass
@@ -433,7 +531,7 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
                 ct = data[aead_offset + 12 :]
                 try:
                     # FIX Blocker 3: Authenticate outer header data[:aead_offset] as AAD
-                    pt = aead.decrypt(aead_nonce, ct, data[:aead_offset])
+                    pt = aead_recv.decrypt(aead_nonce, ct, data[:aead_offset])
                 except Exception:
                     continue
 
@@ -472,13 +570,13 @@ def run_python_proxy(server_host: str, token: str, local_port: int = DEFAULT_LOC
                     out_hdr.extend(secrets.token_bytes(junk_len))
 
                 # FIX Blocker 3: Authenticate outer header as AAD in AEAD Poly1305
-                ct = aead.encrypt(aead_nonce, frame, bytes(out_hdr))
+                ct = aead_send.encrypt(aead_nonce, frame, bytes(out_hdr))
 
                 out_pkt = bytearray(out_hdr)
                 out_pkt.extend(aead_nonce)
                 out_pkt.extend(ct)
 
-                cur_port = compute_hopper_port(payload_key, DEFAULT_SERVER_PORT, port_count, hop_interval)
+                cur_port = compute_hopper_port(send_key, DEFAULT_SERVER_PORT, port_count, hop_interval)
                 sock.sendto(bytes(out_pkt), (server_ip, cur_port))
 
     except KeyboardInterrupt:

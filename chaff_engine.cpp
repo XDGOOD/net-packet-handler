@@ -1,5 +1,6 @@
 #include "chaff_engine.h"
 #include "traffic_shaper.h"
+#include "crypto_utils.h"
 #include <random>
 #include <openssl/rand.h>
 #include <openssl/evp.h>
@@ -7,9 +8,6 @@
 #include <arpa/inet.h>
 #include <iostream>
 
-// Use the function from client.cpp for masking
-extern bool mask_unmask_header(const uint8_t* in, size_t len, const uint8_t* mask_key, const uint8_t* hdr_iv, uint8_t* out);
-extern bool chacha20_poly1305_encrypt(const uint8_t* pt, size_t pt_len, const uint8_t* key, const uint8_t* nonce, uint8_t* ct, size_t& ct_len);
 static const std::string CHAFF_VER_MAGIC = "AG2\x01";
 
 namespace {
@@ -95,13 +93,7 @@ size_t ChaffEngine::build_chaff_packet(const uint8_t* raw_kid, const uint8_t* ma
     std::memcpy(aead_nonce, &tx_seq, sizeof(uint64_t));
     RAND_bytes(aead_nonce + 8, 4);
 
-    // Stack scratch for ciphertext
-    uint8_t cbuf[130 + 16];
-    size_t elen = 0;
-    if (!chacha20_poly1305_encrypt(pbuf, pt_len, send_key, aead_nonce, cbuf, elen)) {
-        return 0;
-    }
-
+    // Header preparation
     uint8_t hdr_plain[16];
     std::memcpy(hdr_plain, raw_kid, 8);
     hdr_plain[8] = 0;
@@ -117,16 +109,20 @@ size_t ChaffEngine::build_chaff_packet(const uint8_t* raw_kid, const uint8_t* ma
         return 0;
     }
 
-    size_t total_len = 12 + 16 + 12 + elen;
+    size_t aead_offset = 12 + 16;
+    std::memcpy(out_buf, hdr_iv, 12);
+    std::memcpy(out_buf + 12, masked_hdr, 16);
+    std::memcpy(out_buf + aead_offset, aead_nonce, 12);
+
+    size_t elen = 0;
+    // Authenticate outer header as AAD per RFC/AEGS v4 wire spec
+    if (!chacha20_poly1305_encrypt(pbuf, pt_len, send_key, aead_nonce, out_buf + aead_offset + 12, elen, out_buf, aead_offset)) {
+        return 0;
+    }
+
+    size_t total_len = aead_offset + 12 + elen;
     if (total_len > max_out_len) return 0;
-
-    size_t off = 0;
-    std::memcpy(out_buf + off, hdr_iv, 12); off += 12;
-    std::memcpy(out_buf + off, masked_hdr, 16); off += 16;
-    std::memcpy(out_buf + off, aead_nonce, 12); off += 12;
-    std::memcpy(out_buf + off, cbuf, elen); off += elen;
-
-    return off;
+    return total_len;
 }
 
 std::vector<uint8_t> ChaffEngine::build_chaff_packet(const uint8_t* raw_kid, const uint8_t* mask_key,

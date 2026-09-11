@@ -43,172 +43,16 @@
 #include "aegs_config.h"
 #include "network_security.h"
 #include "backpressure.h"
+#include "crypto_utils.h"
 
 #ifndef SO_REUSEPORT
 #define SO_REUSEPORT 15
 #endif
 
-// --- AEGS Protocol v2 Constants ---
-// AWG v1/v2/v3 Obfuscation & Noise Architecture + VLESS-REALITY Mimicry
-const std::string VER_MAGIC = "AG2\x01"; // 4-byte internal magic post unmasking
+// Server-specific constants
 const std::string WG_HOST = "wg-core";
 const int WG_PORT = 51820;
 const int MAX_EVENTS = 1024;
-
-const size_t BUFFER_SIZE = 64000;
-const size_t PAD_MIN = 32;
-const size_t PAD_MAX = 256;
-const size_t FRAME_HDR = 2;
-const size_t TAG_LEN = 16;
-const size_t INTERNAL_BUF_SIZE = 65535;
-
-const int PBKDF2_ITERATIONS = 200000;
-
-// --- Key & Header Mask Derivation (HKDF-SHA256) ---
-bool derive_master_key(const std::string& token, const std::string& salt, uint8_t* master_key_out) {
-    return PKCS5_PBKDF2_HMAC(token.c_str(), (int)token.length(),
-                              reinterpret_cast<const unsigned char*>(salt.c_str()), (int)salt.length(),
-                              PBKDF2_ITERATIONS, EVP_sha256(), 32, master_key_out) == 1;
-}
-
-bool hkdf_expand(const uint8_t* master_key, size_t master_key_len, const std::string& info, uint8_t* out, size_t out_len) {
-    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
-    if (!pctx) return false;
-    if (EVP_PKEY_derive_init(pctx) <= 0 ||
-        EVP_PKEY_CTX_set_hkdf_md(pctx, EVP_sha256()) <= 0 ||
-        EVP_PKEY_CTX_set1_hkdf_salt(pctx, (const unsigned char*)"aegis-v2-salt", 13) <= 0 ||
-        EVP_PKEY_CTX_set1_hkdf_key(pctx, master_key, (int)master_key_len) <= 0 ||
-        EVP_PKEY_CTX_add1_hkdf_info(pctx, (const unsigned char*)info.data(), (int)info.size()) <= 0 ||
-        EVP_PKEY_derive(pctx, out, &out_len) <= 0) {
-        EVP_PKEY_CTX_free(pctx);
-        return false;
-    }
-    EVP_PKEY_CTX_free(pctx);
-    return true;
-}
-
-// RAII thread_local EVP_CIPHER_CTX holder to guarantee zero heap allocations on the packet hot path
-struct ThreadLocalCipherCtx {
-    EVP_CIPHER_CTX* ctx = nullptr;
-
-    ThreadLocalCipherCtx() noexcept {
-        ctx = EVP_CIPHER_CTX_new();
-    }
-
-    ~ThreadLocalCipherCtx() {
-        if (ctx) {
-            EVP_CIPHER_CTX_free(ctx);
-            ctx = nullptr;
-        }
-    }
-
-    ThreadLocalCipherCtx(const ThreadLocalCipherCtx&) = delete;
-    ThreadLocalCipherCtx& operator=(const ThreadLocalCipherCtx&) = delete;
-};
-
-// AWG v3 Dynamic Header Masking (ChaCha20 Stream Cipher)
-bool mask_unmask_header(const uint8_t* in, size_t len, const uint8_t* mask_key, const uint8_t* hdr_iv, uint8_t* out) {
-    uint8_t full_iv[16] = {0};
-    std::memcpy(full_iv + 4, hdr_iv, 12);
-
-    thread_local ThreadLocalCipherCtx tl_ctx;
-    EVP_CIPHER_CTX* ctx = tl_ctx.ctx;
-    if (!ctx) return false;
-    EVP_CIPHER_CTX_reset(ctx);
-
-    int outlen = 0;
-    if (EVP_CipherInit_ex(ctx, EVP_chacha20(), NULL, mask_key, full_iv, 1) != 1 ||
-        EVP_CipherUpdate(ctx, out, &outlen, in, (int)len) != 1) {
-        EVP_CIPHER_CTX_reset(ctx);
-        return false;
-    }
-    int final_len = 0;
-    EVP_CipherFinal_ex(ctx, out + outlen, &final_len);
-    EVP_CIPHER_CTX_reset(ctx);
-    return true;
-}
-
-bool chacha20_poly1305_encrypt(const uint8_t* pt, size_t pt_len, const uint8_t* key, const uint8_t* nonce, uint8_t* ct, size_t& ct_len, const uint8_t* aad = nullptr, size_t aad_len = 0) {
-    thread_local ThreadLocalCipherCtx tl_ctx;
-    EVP_CIPHER_CTX* ctx = tl_ctx.ctx;
-    if (!ctx) return false;
-    EVP_CIPHER_CTX_reset(ctx);
-
-    if (EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) != 1 ||
-        EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) {
-        EVP_CIPHER_CTX_reset(ctx);
-        return false;
-    }
-    int len = 0;
-    if (aad && aad_len > 0) {
-        if (EVP_EncryptUpdate(ctx, NULL, &len, aad, (int)aad_len) != 1) {
-            EVP_CIPHER_CTX_reset(ctx);
-            return false;
-        }
-    }
-    if (EVP_EncryptUpdate(ctx, ct, &len, pt, (int)pt_len) != 1) {
-        EVP_CIPHER_CTX_reset(ctx);
-        return false;
-    }
-    int total_len = len;
-    if (EVP_EncryptFinal_ex(ctx, ct + len, &len) != 1) {
-        EVP_CIPHER_CTX_reset(ctx);
-        return false;
-    }
-    total_len += len;
-    uint8_t tag[16];
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag) != 1) {
-        EVP_CIPHER_CTX_reset(ctx);
-        return false;
-    }
-    std::memcpy(ct + total_len, tag, 16);
-    ct_len = total_len + 16;
-    EVP_CIPHER_CTX_reset(ctx);
-    return true;
-}
-
-bool chacha20_poly1305_decrypt(const uint8_t* ct, size_t ct_len, const uint8_t* key, const uint8_t* nonce, uint8_t* pt, size_t& pt_len, const uint8_t* aad = nullptr, size_t aad_len = 0) {
-    if (ct_len < 16) return false;
-    size_t c_len = ct_len - 16;
-    const uint8_t* tag = ct + c_len;
-
-    thread_local ThreadLocalCipherCtx tl_ctx;
-    EVP_CIPHER_CTX* ctx = tl_ctx.ctx;
-    if (!ctx) return false;
-    EVP_CIPHER_CTX_reset(ctx);
-
-    if (EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) != 1 ||
-        EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) {
-        EVP_CIPHER_CTX_reset(ctx);
-        return false;
-    }
-    int len = 0;
-    if (aad && aad_len > 0) {
-        if (EVP_DecryptUpdate(ctx, NULL, &len, aad, (int)aad_len) != 1) {
-            EVP_CIPHER_CTX_reset(ctx);
-            return false;
-        }
-    }
-    if (EVP_DecryptUpdate(ctx, pt, &len, ct, (int)c_len) != 1) {
-        EVP_CIPHER_CTX_reset(ctx);
-        return false;
-    }
-    int total_len = len;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, const_cast<uint8_t*>(tag)) != 1) {
-        EVP_CIPHER_CTX_reset(ctx);
-        return false;
-    }
-    if (EVP_DecryptFinal_ex(ctx, pt + len, &len) <= 0) {
-        EVP_CIPHER_CTX_reset(ctx);
-        return false;
-    }
-    total_len += len;
-    pt_len = total_len;
-    EVP_CIPHER_CTX_reset(ctx);
-    return true;
-}
 
 
 struct Session {
@@ -309,6 +153,34 @@ static bool check_handshake_rate_limit(uint32_t ip_num, double now) {
     return (it->second.count <= MAX_HANDSHAKES_PER_SEC_PER_IP);
 }
 
+// FIX Review Issue 5: Rate limit slow-path roaming unmask scans to prevent CPU-DoS
+std::unordered_map<uint32_t, HandshakeRateRecord> g_roam_rate_limit;
+std::mutex g_roam_rate_mu;
+const int MAX_ROAMING_SCANS_PER_SEC_PER_IP = 5;
+
+static bool check_roaming_rate_limit(uint32_t ip_num, double now) {
+    std::lock_guard<std::mutex> lock(g_roam_rate_mu);
+    auto it = g_roam_rate_limit.find(ip_num);
+    if (it == g_roam_rate_limit.end()) {
+        if (g_roam_rate_limit.size() >= 4096) {
+            auto oldest = g_roam_rate_limit.begin();
+            for (auto e = g_roam_rate_limit.begin(); e != g_roam_rate_limit.end(); ++e) {
+                if (e->second.window_start < oldest->second.window_start) oldest = e;
+            }
+            if (oldest != g_roam_rate_limit.end()) g_roam_rate_limit.erase(oldest);
+        }
+        g_roam_rate_limit[ip_num] = {now, 1};
+        return true;
+    }
+    if (now - it->second.window_start >= 1.0) {
+        it->second.window_start = now;
+        it->second.count = 1;
+        return true;
+    }
+    it->second.count++;
+    return (it->second.count <= MAX_ROAMING_SCANS_PER_SEC_PER_IP);
+}
+
 // Signal handling & clean shutdown
 static std::atomic<bool> g_running{true};
 static void handle_signal(int sig) {
@@ -349,6 +221,12 @@ void cleanup_maps(double now, IpPool& ip_pool) {
         std::lock_guard<std::mutex> hs_lock(g_hs_rate_mu);
         for (auto it = g_hs_rate_limit.begin(); it != g_hs_rate_limit.end(); ) {
             if (now - it->second.window_start > 10.0) it = g_hs_rate_limit.erase(it); else ++it;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> roam_lock(g_roam_rate_mu);
+        for (auto it = g_roam_rate_limit.begin(); it != g_roam_rate_limit.end(); ) {
+            if (now - it->second.window_start > 10.0) it = g_roam_rate_limit.erase(it); else ++it;
         }
     }
     for (auto it = sessions.begin(); it != sessions.end(); ) {
@@ -552,12 +430,26 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
             uint64_t resumed_sid = 0;
             uint32_t resumed_ip = 0;
             Session* resumed_sess = nullptr;
+
+            char kid_hex[17];
+            for (int j = 0; j < 8; j++) sprintf(&kid_hex[j*2], "%02x", rtok.key_id[j]);
+            kid_hex[16] = 0;
+
             {
                 std::lock_guard<std::mutex> lk(sessions_mu);
-                for (auto& kv : sessions) {
-                    if (g_resumption.verify(rtok, kv.second->master_key, resumed_sid, resumed_ip)) {
-                        resumed_sess = kv.second;
-                        break;
+                // FIX O(1) Resumption Scaling: Look up session directly by KeyID in token
+                auto sit = sessions.find(kid_hex);
+                if (sit != sessions.end()) {
+                    if (g_resumption.verify(rtok, sit->second->master_key, resumed_sid, resumed_ip)) {
+                        resumed_sess = sit->second;
+                    }
+                } else {
+                    // Safe fallback if key_id is absent (e.g. legacy test token)
+                    for (auto& kv : sessions) {
+                        if (g_resumption.verify(rtok, kv.second->master_key, resumed_sid, resumed_ip)) {
+                            resumed_sess = kv.second;
+                            break;
+                        }
                     }
                 }
             }
@@ -588,7 +480,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                     }
                 }
                 ResumptionToken new_tok;
-                if (g_resumption.issue(s->session_id, s->assigned_ip, s->master_key, new_tok)) {
+                if (g_resumption.issue(s->session_id, s->assigned_ip, s->master_key, new_tok, (const uint8_t*)&s->key_id_raw)) {
                     uint8_t rpkt[97];
                     rpkt[0] = 0x03;
                     memcpy(rpkt + 1, &new_tok, 96);
@@ -647,6 +539,8 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                     s->client_addr = caddr;
                     s->has_client = true;
                     s->v3_handshake_done = true;
+                    s->tx_seq = 0;
+                    s->replay_filter = AntiReplayFilter();
                     s->last_activity = now;
                     s->last_server_fd = fd;
                 }
@@ -656,7 +550,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                 std::cout << "[HS] Client " << inet_ntoa(caddr.sin_addr) << " assigned " << IpPool::to_string(s->assigned_ip) << "\n";
                 
                 ResumptionToken rtok;
-                if (g_resumption.issue(s->session_id, s->assigned_ip, s->master_key, rtok)) {
+                if (g_resumption.issue(s->session_id, s->assigned_ip, s->master_key, rtok, (const uint8_t*)&s->key_id_raw)) {
                     uint8_t rtok_pkt[97];
                     rtok_pkt[0] = 0x03; // RESUMPTION_TOKEN
                     memcpy(rtok_pkt + 1, &rtok, 96);
@@ -693,6 +587,11 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
 
         // Slow-path fallback: scan registered sessions if new connection or roaming
         if (!matched_sess) {
+            // FIX Review Issue 5: Rate limit slow-path unmask scans to prevent CPU-DoS from unknown packet floods
+            if (!check_roaming_rate_limit(ip_num, now)) {
+                record_fail(fd, caddr, pkt_data, (size_t)len, ip_num, now, 0.5);
+                return;
+            }
             std::lock_guard<std::mutex> lk(sessions_mu);
             for (auto& kv : sessions) {
                 Session* s = kv.second;

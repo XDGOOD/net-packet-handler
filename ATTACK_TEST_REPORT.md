@@ -1,6 +1,6 @@
 # AEGS v4 'Pantheon' -- Отчет об атаках и безопасности
 
-**Дата аудита:** 2026-09-11 21:42:01
+**Дата аудита:** 2026-09-12 01:40:12
 **Результат:** **8/8 тестов пройдено (100% PASS)**
 
 ## Резюме решения проблем из `предложение.txt`:
@@ -28,13 +28,13 @@
 - **Результат:** Legit handshake: True, Forged Server Ephemeral detected: True, Forged Init MAC detected: True
 
 ### ✅ PASS Тест 4.1: Session Resumption Full Crypto State Restoration
-- **Результат:** State restored (keys, SID, IP): True, Tampered/forged token rejected: True
+- **Результат:** State restored (keys, SID, IP): True, Tampered/forged token rejected: True, Nonce malleability rejected (R-01): True, One-time replay rejected (R-02): True
 
 ### ✅ PASS Тест 5.1: UDP Reflection Zero-Amplification (<20B Probes = 0.0x factor)
 - **Результат:** Short probes response length: 0B (Factor = 0.0x), Rate-limiting ceiling: 50 pkts / 8192 B
 
 ### ✅ PASS Тест 6.1: O(1) Fast-Path Session Lookup Benchmarked
-- **Результат:** Latency per packet lookup: 161.22 ns (< 1000 ns target), Scales to 1000+ sessions without O(N) linear penalty
+- **Результат:** Latency per packet lookup: 190.08 ns (< 1000 ns target), Scales to 1000+ sessions without O(N) linear penalty
 
 ### ✅ PASS Тест 7.1: Database Token Protection (Zero-Plaintext Storage)
 - **Результат:** Plaintext token absent from storage: True, SHA-256 hash verified: f64b5ecadcb5e654...

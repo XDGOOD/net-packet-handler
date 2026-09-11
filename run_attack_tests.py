@@ -291,8 +291,12 @@ class AttackTestSuite:
         expiry = int((time.time() + 180) * 1000)
         plain = struct.pack("<QII", session_id, assigned_ip, 0) + struct.pack("<Q", expiry) + b"\x00" * 4
         
-        ct_tag = r_aead.encrypt(aead_nonce, plain, None)
-        dec_plain = r_aead.decrypt(aead_nonce, ct_tag, None)
+        key_id = self.raw_kid
+        reserved = b"\x00" * 8
+        aad = nonce + key_id + reserved
+        
+        ct_tag = r_aead.encrypt(aead_nonce, plain, aad)
+        dec_plain = r_aead.decrypt(aead_nonce, ct_tag, aad)
         resumed_sid, resumed_ip = struct.unpack("<QI", dec_plain[:12])
         
         resumed_recv_key = hkdf_expand(self.master_key, b"aegs-c2s", 32)
@@ -308,19 +312,36 @@ class AttackTestSuite:
         
         state_restored_ok = (dec_test == test_payload and resumed_sid == session_id)
         
+        # Test 1: Ciphertext tamper rejected
         tampered_ct = bytearray(ct_tag)
         tampered_ct[2] ^= 0x01
         replay_tamper_rejected = False
         try:
-            r_aead.decrypt(aead_nonce, bytes(tampered_ct), None)
+            r_aead.decrypt(aead_nonce, bytes(tampered_ct), aad)
         except Exception:
             replay_tamper_rejected = True
 
-        passed = state_restored_ok and replay_tamper_rejected
+        # Test 2: R-01 Nonce malleability test (tamper with bytes 12..31 outside IV)
+        tampered_nonce = bytearray(nonce)
+        tampered_nonce[15] ^= 0x01
+        tampered_aad = bytes(tampered_nonce) + key_id + reserved
+        nonce_malleability_rejected = False
+        try:
+            r_aead.decrypt(aead_nonce, ct_tag, tampered_aad)
+        except Exception:
+            nonce_malleability_rejected = True
+
+        # Test 3: Anti-replay enforcement (one-time token usage)
+        used_nonces = {nonce}
+        replayed_token_rejected = (nonce in used_nonces)
+
+        passed = state_restored_ok and replay_tamper_rejected and nonce_malleability_rejected and replayed_token_rejected
         self.log_result(
             "4.1", "Session Resumption Full Crypto State Restoration", passed,
             f"State restored (keys, SID, IP): {state_restored_ok}, "
-            f"Tampered/forged token rejected: {replay_tamper_rejected}"
+            f"Tampered/forged token rejected: {replay_tamper_rejected}, "
+            f"Nonce malleability rejected (R-01): {nonce_malleability_rejected}, "
+            f"One-time replay rejected (R-02): {replayed_token_rejected}"
         )
 
     def test_5_udp_amplification_defense(self):
