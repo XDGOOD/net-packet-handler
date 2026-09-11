@@ -55,6 +55,14 @@ AEGS v4 is an advanced transport protocol specifically engineered to defeat both
 
 ---
 
+## 📡 Protocol Wire Specification
+* **HANDSHAKE_INIT** (72 bytes): `type(1)` + `reserved(7)` + `key_id(8)` + `ephemeral_pk(32)` + `timestamp_ms(8)` + `mac(16, HMAC-SHA256(MasterKey))`
+* **HANDSHAKE_RESP** (80 bytes): `type(1)` + `reserved(7)` + `session_id(8)` + `server_epk(32)` + `encrypted_config(16)` + `aead_tag(16, Poly1305)`
+* **DATA packet**: `hdr_iv(12)` + `masked_hdr(16, ChaCha20)` + `[junk/chaff]` + `aead_nonce(12)` + `ChaCha20-Poly1305(frame)`
+* **Frame**: `plen(2)` + `ip_packet(plen)` + `bimodal_padding` (target ~256B / ~1350B)
+
+---
+
 ## 📊 Comparison Table: AEGS v4 Pantheon vs Competitors
 
 | Feature | WireGuard | AmneziaWG 3.1 | XTLS-Reality | **AEGS v4 Pantheon** |
@@ -91,6 +99,10 @@ Run the suite:
 ```bash
 python test_suite_v4.py
 # or C++ native test runner:
+./build/aegis_test
+
+# Or compile and run with AddressSanitizer & UndefinedBehaviorSanitizer:
+cmake -B build -DENABLE_ASAN=ON && cmake --build build
 ./build/aegis_test
 ```
 
