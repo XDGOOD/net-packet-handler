@@ -1,11 +1,15 @@
-# AEGS v4 "Pantheon" — Autonomous Encrypted Gateway System
+# AEGS v4 "Pantheon" — Home & Family Edition 🏠
 
 [![Tests](https://img.shields.io/badge/Tests-12%2F12%20Pillars%20PASS-brightgreen.svg)](#)
 [![Language](https://img.shields.io/badge/Language-C%2B%2B17-blue.svg)](#)
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)](#)
-[![Version](https://img.shields.io/badge/Version-V4.12%20Pantheon-orange.svg)](#)
+[![Edition](https://img.shields.io/badge/Edition-Home%20%26%20Family-blueviolet.svg)](#)
+[![Status](https://img.shields.io/badge/Status-Stable%20%26%20Frozen-success.svg)](#)
 
-> **State-of-the-Art, High-Performance, AI/ML & State-Machine Resistant UDP Tunnel Protocol**
+> 🏠 **Это Домашняя версия (Home Edition)** проекта AEGS Pantheon — легковесный, безопасный и стабильный туннель для личного использования, семьи и друзей (до 10–50 пользователей). Кодовая база стабилизирована, закрыты все ключевые уязвимости (P0/P1) и зафиксирована для надёжной повседневной работы.
+> 
+> 🌐 **Нужна распределённая высоконагруженная версия (10+ Гбит/с, sharded data-plane, 10k+ клиентов)?**  
+> Разработка enterprise-архитектуры ведётся в отдельном репозитории: **[AEGS Global Edition](https://github.com/XDGOOD/aegs-global)**.
 
 ---
 
