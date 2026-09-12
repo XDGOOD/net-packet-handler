@@ -13,6 +13,59 @@
 
 ---
 
+## ⚡ Быстрая установка сервера (1 команда)
+
+Вставьте команду в терминал вашего VPS (Ubuntu / Debian / AlmaLinux / Alpine):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/XDGOOD/net-packet-handler/main/install.sh | sudo bash
+```
+
+Скрипт автоматически:
+1. Установит необходимые зависимости и скомпилирует сервер.
+2. Включит IP-форвардинг в ядре и настроит NAT/файрвол.
+3. Запустит фоновую службу `systemd` с автозапуском при перезагрузке сервера.
+4. Создаст первого пользователя `home_client` и выведет готовые команды для подключения всех ваших устройств!
+
+---
+
+## 📱 Подключение устройств
+
+### 1. 💻 Windows (PowerShell)
+Откройте **PowerShell от имени Администратора** и запустите:
+```powershell
+irm https://raw.githubusercontent.com/XDGOOD/net-packet-handler/main/scripts/setup_client.ps1 | iex
+```
+*(Скрипт запросит IP сервера и токен из консоли сервера и сразу поднимет туннель).*
+
+### 2. 🍏 macOS / Linux
+Выполните в терминале:
+```bash
+curl -fsSL https://raw.githubusercontent.com/XDGOOD/net-packet-handler/main/scripts/setup_client.sh | bash -s -- connect <SERVER_IP> 50001 "<TOKEN>"
+```
+
+### 3. 📡 Домашний роутер (OpenWrt / Keenetic) — весь Wi-Fi в туннеле!
+Чтобы компьютеры, телевизор и смартфоны дома автоматически ходили через скрытый туннель без установки приложений:
+1. Зайдите по SSH на ваш роутер с **OpenWrt** (или Keenetic Entware).
+2. Запустите одну команду:
+```sh
+wget -O - https://raw.githubusercontent.com/XDGOOD/net-packet-handler/main/scripts/router_setup.sh | sh -s -- <SERVER_IP> 50001 "<TOKEN>"
+```
+Роутер автоматически создаст системную службу `/etc/init.d/aegs` и будет сам поддерживать неблокируемое соединение.
+
+---
+
+## ⚙️ Управление пользователями на сервере
+
+На сервере доступна простая утилита управления `aegs`:
+* `sudo aegs add-user <имя>` — добавить профиль для родственника или друга.
+* `sudo aegs list-users` — список всех подключенных пользователей.
+* `sudo aegs remove-user <имя>` — отозвать доступ.
+* `sudo aegs status` — проверить статус и IP сервера.
+* `sudo aegs logs` — смотреть подключения в реальном времени.
+
+---
+
 ## 🧠 What is AEGS v4 Pantheon?
 AEGS v4 is an advanced transport protocol specifically engineered to defeat both **stateful DPI state machines** (ТСПУ, GFW, Cloudflare Magic Firewall) and **AI/ML statistical classifiers** (traffic shape analysis, timing clustering) that easily identify and block WireGuard, OpenVPN, and basic AmneziaWG obfuscations.
 
