@@ -1,18 +1,14 @@
 #pragma once
 // ==============================================================================
-// AEGS v4 "Pantheon" -- Central Server Configuration
+// AEGS v6 "Titan" -- Central Server Configuration
 // ==============================================================================
-// Reads runtime settings from environment variables. New variables added for
-// Component 3 (DPI bypass):
-//   AEGS_PORT_COUNT      - number of simultaneous hopping ports  (PortHopper)
-//   AEGS_HOP_INTERVAL    - rotation period in seconds            (PortHopper)
-//   AEGS_QUIC_MIMICRY    - 0|1, enable QUIC Initial header wrap  (ProtocolMimicry)
-//   AEGS_TRAFFIC_SHAPING - 0|1, enable send jitter              (TrafficShaper)
-//   AEGS_JITTER_MS       - max jitter in ms                      (TrafficShaper)
+// Reads runtime settings from environment variables.
+// Validates and clamps MTU (576 to 9000 Jumbo Frame) and port hopping parameters.
 // ==============================================================================
 #include <cstdint>
 #include <string>
 #include <cstdlib>
+#include <algorithm>
 
 struct AegsConfig {
     // --- Network / port hopping (Component 3) --------------------------------
@@ -69,6 +65,8 @@ struct AegsConfig {
 
         if (c.port_count < 1)  c.port_count = 1;
         if (c.port_count > 64) c.port_count = 64;
+        if (c.mtu < 576)       c.mtu = 576;
+        if (c.mtu > 9000)      c.mtu = 9000;
         return c;
     }
 };

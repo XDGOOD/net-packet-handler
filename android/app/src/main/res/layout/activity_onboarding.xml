@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0D0D10"
+    android:orientation="vertical"
+    android:padding="24dp">
+
+    <!-- Top Bar -->
+    <RelativeLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="16dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="AEGS TITAN"
+            android:textColor="#F59E0B"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/btn_skip"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_alignParentEnd="true"
+            android:text="Пропустить"
+            android:textColor="#A8A29E"
+            android:textSize="13sp" />
+    </RelativeLayout>
+
+    <!-- Center Viewport for Animations / Source Selection -->
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <com.aegs.titan.AnimShieldSpeedometerView
+            android:id="@+id/anim_view"
+            android:layout_width="260dp"
+            android:layout_height="260dp"
+            android:layout_gravity="center" />
+
+        <!-- Source Selector Cards (Step 3) -->
+        <LinearLayout
+            android:id="@+id/ll_source_selector"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:id="@+id/card_source_cloud"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="#1E1C24"
+                android:padding="16dp"
+                android:layout_marginBottom="12dp"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="По ссылке / Подписке"
+                    android:textColor="#FFFBEB"
+                    android:textSize="15sp"
+                    android:textStyle="bold" />
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Вставить ссылку подписки aegs:// или vless://"
+                    android:textColor="#A8A29E"
+                    android:textSize="12sp"
+                    android:layout_marginTop="2dp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/card_source_qr"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="#1E1C24"
+                android:padding="16dp"
+                android:layout_marginBottom="12dp"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Сканировать QR-код"
+                    android:textColor="#FFFBEB"
+                    android:textSize="15sp"
+                    android:textStyle="bold" />
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Быстрый импорт настроек через камеру"
+                    android:textColor="#A8A29E"
+                    android:textSize="12sp"
+                    android:layout_marginTop="2dp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/card_source_vps"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="#1E1C24"
+                android:padding="16dp"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Свой сервер (VPS)"
+                    android:textColor="#FFFBEB"
+                    android:textSize="15sp"
+                    android:textStyle="bold" />
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Подключить свой Linux сервер (IP, порт, ключ)"
+                    android:textColor="#A8A29E"
+                    android:textSize="12sp"
+                    android:layout_marginTop="2dp" />
+            </LinearLayout>
+        </LinearLayout>
+    </FrameLayout>
+
+    <!-- Text Block -->
+    <TextView
+        android:id="@+id/tv_onboarding_title"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Добро пожаловать в AEGS"
+        android:textColor="#FFFBEB"
+        android:textSize="21sp"
+        android:textStyle="bold"
+        android:gravity="center"
+        android:layout_marginBottom="8dp" />
+
+    <TextView
+        android:id="@+id/tv_onboarding_desc"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Свободный и безопасный интернет без цензуры, слежки и замедлений провайдера."
+        android:textColor="#A8A29E"
+        android:textSize="14sp"
+        android:gravity="center"
+        android:lineSpacingExtra="3dp"
+        android:layout_marginBottom="24dp" />
+
+    <!-- Dots -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:orientation="horizontal"
+        android:layout_marginBottom="24dp">
+
+        <View
+            android:id="@+id/dot_0"
+            android:layout_width="24dp"
+            android:layout_height="6dp"
+            android:layout_marginEnd="6dp"
+            android:background="#F59E0B" />
+        <View
+            android:id="@+id/dot_1"
+            android:layout_width="8dp"
+            android:layout_height="6dp"
+            android:layout_marginEnd="6dp"
+            android:background="#33FFFFFF" />
+        <View
+            android:id="@+id/dot_2"
+            android:layout_width="8dp"
+            android:layout_height="6dp"
+            android:layout_marginEnd="6dp"
+            android:background="#33FFFFFF" />
+        <View
+            android:id="@+id/dot_3"
+            android:layout_width="8dp"
+            android:layout_height="6dp"
+            android:background="#33FFFFFF" />
+    </LinearLayout>
+
+    <!-- Next Button -->
+    <Button
+        android:id="@+id/btn_next"
+        android:layout_width="match_parent"
+        android:layout_height="52dp"
+        android:text="ДАЛЕЕ ➔"
+        android:textColor="#261102"
+        android:textStyle="bold"
+        android:textSize="15sp"
+        android:backgroundTint="#F59E0B" />
+</LinearLayout>

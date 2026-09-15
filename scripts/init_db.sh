@@ -185,17 +185,17 @@ echo -e "${CYAN}[3/4] Registering user in database...${NC}"
 ESCAPED_TOKEN="${TOKEN//\'/\'\'}"
 exec_sql "INSERT OR REPLACE INTO users (aegis_key_id, aegis_token) VALUES ('${KEY_ID}', '${ESCAPED_TOKEN}');"
 
-# 5. Fix permissions for non-root container user (UID/GID 10001)
-echo -e "${CYAN}[4/4] Setting file permissions for container user aegis (${AEGIS_UID}:${AEGIS_GID})...${NC}"
-chmod 775 "$DATA_DIR" || true
-chmod 664 "$DB_PATH" || true
+# 5. Fix permissions for non-root container user (UID/GID 10001) - owner only
+echo -e "${CYAN}[4/4] Setting secure file permissions (0700 dir, 0600 db) for container user aegis (${AEGIS_UID}:${AEGIS_GID})...${NC}"
+chmod 700 "$DATA_DIR" || true
+chmod 600 "$DB_PATH" || true
 if [ "$(id -u)" -eq 0 ]; then
     chown -R "${AEGIS_UID}:${AEGIS_GID}" "$DATA_DIR" 2>/dev/null || true
 fi
 
 echo ""
 echo -e "${GREEN}=================================================================${NC}"
-echo -e "${BOLD}🎉 AEGS Protocol v2 Client Credentials Successfully Generated!${NC}"
+echo -e "${BOLD}🎉 AEGS Protocol v6 Titan Client Credentials Successfully Generated!${NC}"
 echo -e "${GREEN}=================================================================${NC}"
 echo -e "  ${BOLD}Database Path:${NC}     ${DB_PATH}"
 echo -e "  ${BOLD}AEGS Key ID:${NC}       ${YELLOW}${KEY_ID}${NC}"

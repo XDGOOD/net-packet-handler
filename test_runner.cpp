@@ -31,6 +31,8 @@
 #include "crypto_utils.h"
 #include "session_resumption.h"
 #include "handshake.h"
+#include "packet_scratch.h"
+#include "backpressure.h"
 
 
 double calculate_entropy(const uint8_t* data, size_t len) {
@@ -155,6 +157,47 @@ int main() {
 
     std::cout << "  [PASS] RFC 6479 Multi-Word (" << AntiReplayFilter::WINDOW_SIZE
               << "-packet) Anti-Replay Filter: 100% Deterministic (Zero Allocations)" << std::endl;
+
+    // Test Two-Phase Anti-Replay (Peek before verify, Commit only after AEAD auth)
+    AntiReplayFilter rf_twophase;
+    assert(!rf_twophase.check_peek(10)); // Candidate 10 is valid
+    // Simulated auth failure: do NOT call update_commit(10)
+    assert(!rf_twophase.check_peek(10)); // Sequence 10 is STILL valid because it was never committed!
+    // Legitimate packet arrives with seq 10 and passes AEAD
+    rf_twophase.update_commit(10);
+    assert(rf_twophase.check_peek(10));  // Now seq 10 is committed and correctly rejected as replay!
+    assert(rf_twophase.check_and_update(10)); // Replay rejected
+    std::cout << "  [PASS] Two-Phase Anti-Replay (Peek-before-decrypt, Commit-after-verify)" << std::endl;
+
+    // Test AIMD Adaptive Egress Pacing in BackpressureController
+    BackpressureController bp;
+    assert(bp.pacing_delay_us() == 0);
+    bp.record_egress_failure(EAGAIN);
+    assert(bp.pacing_delay_us() == BackpressureController::kInitialCongestionDelayUs);
+    bp.record_egress_failure(EAGAIN);
+    assert(bp.pacing_delay_us() == BackpressureController::kInitialCongestionDelayUs * 2);
+    bp.record_egress_success();
+    assert(bp.pacing_delay_us() < BackpressureController::kInitialCongestionDelayUs * 2);
+    std::cout << "  [PASS] BackpressureController AIMD Adaptive Egress Pacing" << std::endl;
+
+    // Test PacketScratch Jumbo MTU (TX_SLOT_SIZE = 9216) and oversized drop counter
+    auto& scratch_test = get_packet_scratch();
+    scratch_test.reset_tx();
+    struct sockaddr_in dummy_addr{};
+    dummy_addr.sin_family = AF_INET;
+    std::vector<uint8_t> jumbo_pkt(9000, 0xAA);
+    scratch_test.queue_tx(1, dummy_addr, jumbo_pkt.data(), jumbo_pkt.size());
+    assert(scratch_test.tx_count == 1);
+    assert(scratch_test.tx_slots[0].len == 9000);
+    scratch_test.reset_tx();
+
+    // Verify oversized packet drop
+    std::vector<uint8_t> oversized_pkt(10000, 0xBB);
+    size_t prev_dropped = scratch_test.dropped_oversized;
+    scratch_test.queue_tx(1, dummy_addr, oversized_pkt.data(), oversized_pkt.size());
+    assert(scratch_test.tx_count == 0);
+    assert(scratch_test.dropped_oversized == prev_dropped + 1);
+    std::cout << "  [PASS] PacketScratch Jumbo MTU (9000B) & Oversized Drop Counter" << std::endl;
 
     int tamper_blocked = 0;
     for (int flip = 0; flip < 50; ++flip) {

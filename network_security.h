@@ -15,7 +15,27 @@
 #include <array>
 #include <cstddef>
 
-class KillSwitch {
+enum class TxPhase {
+    IDLE,
+    PREPARED,
+    APPLIED,
+    VERIFIED,
+    COMMITTED,
+    ROLLED_BACK
+};
+
+class INetworkTransaction {
+public:
+    virtual ~INetworkTransaction() = default;
+    virtual bool prepare() = 0;
+    virtual bool apply() = 0;
+    virtual bool verify() = 0;
+    virtual bool commit() = 0;
+    virtual void rollback() = 0;
+    virtual TxPhase phase() const noexcept = 0;
+};
+
+class KillSwitch : public INetworkTransaction {
 public:
     KillSwitch() noexcept;
     ~KillSwitch();
@@ -38,6 +58,12 @@ public:
     bool disable() noexcept;
 
     bool is_active() const noexcept { return active_; }
+    TxPhase phase() const noexcept override { return phase_; }
+    bool prepare() override;
+    bool apply() override;
+    bool verify() override;
+    bool commit() override;
+    void rollback() override;
 
     // Generates the exact shell commands needed for audit/dry-run
     std::vector<std::string> generate_rules(const std::string& server_ip,
@@ -52,6 +78,7 @@ public:
 
 private:
     bool active_;
+    TxPhase phase_{TxPhase::IDLE};
     std::string server_ip_;
     uint16_t base_port_;
     int port_count_;
@@ -63,7 +90,7 @@ private:
     bool is_ipv6_available() const noexcept;
 };
 
-class DnsLeakProtector {
+class DnsLeakProtector : public INetworkTransaction {
 public:
     DnsLeakProtector() noexcept;
     ~DnsLeakProtector();
@@ -82,6 +109,12 @@ public:
     bool disable() noexcept;
 
     bool is_active() const noexcept { return active_; }
+    TxPhase phase() const noexcept override { return phase_; }
+    bool prepare() override;
+    bool apply() override;
+    bool verify() override;
+    bool commit() override;
+    void rollback() override;
 
     std::vector<std::string> generate_rules(const std::string& tun_iface) const;
     std::vector<std::string> generate_ipv6_rules() const;
@@ -89,6 +122,7 @@ public:
 
 private:
     bool active_;
+    TxPhase phase_{TxPhase::IDLE};
     std::string tun_iface_;
     std::string secure_dns_;
     std::string original_resolv_conf_;
@@ -152,13 +186,38 @@ public:
         bitmap_.fill(0);
     }
 
-    // Returns true if packet is replay or out of window (rejected).
-    // Returns false if packet is valid and window is updated (accepted).
-    bool check_and_update(uint64_t seq) noexcept {
+    // Phase 1: Read-only peek check before decryption (does not commit seq or update window)
+    // Returns true if packet is a replay or too old (rejected).
+    // Returns false if packet is a valid candidate for decryption.
+    bool check_peek(uint64_t seq) const noexcept {
         if (seq == 0) return true; // Sequence 0 is invalid/rejected
 
         if constexpr (BITMAP_WORDS == 1) {
-            // 64-bit single-word sliding window (backwards-compatible)
+            if (seq > last_seq_) return false; // Newer sequence, valid candidate
+            uint64_t diff = last_seq_ - seq;
+            if (diff >= 64) return true; // Too old
+            if (bitmap_[0] & (1ULL << diff)) return true; // Already seen
+            return false;
+        } else {
+            if (seq > last_seq_) return false; // Newer sequence, valid candidate
+            uint64_t diff = last_seq_ - seq;
+            if (diff >= WINDOW_SIZE || ((last_seq_ >> 6) - (seq >> 6) >= BITMAP_WORDS)) {
+                return true; // Out of sliding window (too old) -> reject
+            }
+            size_t word_idx = static_cast<size_t>((seq >> 6) & (BITMAP_WORDS - 1));
+            uint64_t bit_mask = 1ULL << (seq & 63);
+            if (bitmap_[word_idx] & bit_mask) {
+                return true; // Already seen -> replay detected
+            }
+            return false;
+        }
+    }
+
+    // Phase 2: Commits sequence number and updates window ONLY after AEAD authentication succeeds
+    void update_commit(uint64_t seq) noexcept {
+        if (seq == 0) return;
+
+        if constexpr (BITMAP_WORDS == 1) {
             if (seq > last_seq_) {
                 uint64_t diff = seq - last_seq_;
                 if (diff < 64) {
@@ -167,15 +226,13 @@ public:
                     bitmap_[0] = 1ULL;
                 }
                 last_seq_ = seq;
-                return false;
+                return;
             }
             uint64_t diff = last_seq_ - seq;
-            if (diff >= 64) return true;
-            if (bitmap_[0] & (1ULL << diff)) return true;
-            bitmap_[0] |= (1ULL << diff);
-            return false;
+            if (diff < 64) {
+                bitmap_[0] |= (1ULL << diff);
+            }
         } else {
-            // Multi-word RFC 6479 circular buffer sliding window
             if (seq > last_seq_) {
                 uint64_t diff = seq - last_seq_;
                 if (diff >= WINDOW_SIZE) {
@@ -189,24 +246,23 @@ public:
                 }
                 bitmap_[(seq >> 6) & (BITMAP_WORDS - 1)] |= (1ULL << (seq & 63));
                 last_seq_ = seq;
-                return false;
+                return;
             }
 
             uint64_t diff = last_seq_ - seq;
-            if (diff >= WINDOW_SIZE || ((last_seq_ >> 6) - (seq >> 6) >= BITMAP_WORDS)) {
-                return true; // Out of sliding window (too old) -> reject
+            if (diff < WINDOW_SIZE && ((last_seq_ >> 6) - (seq >> 6) < BITMAP_WORDS)) {
+                size_t word_idx = static_cast<size_t>((seq >> 6) & (BITMAP_WORDS - 1));
+                bitmap_[word_idx] |= (1ULL << (seq & 63));
             }
-
-            size_t word_idx = static_cast<size_t>((seq >> 6) & (BITMAP_WORDS - 1));
-            uint64_t bit_mask = 1ULL << (seq & 63);
-
-            if (bitmap_[word_idx] & bit_mask) {
-                return true; // Already seen -> replay detected
-            }
-
-            bitmap_[word_idx] |= bit_mask;
-            return false; // Valid out-of-order packet accepted
         }
+    }
+
+    // Returns true if packet is replay or out of window (rejected).
+    // Returns false if packet is valid and window is updated (accepted).
+    bool check_and_update(uint64_t seq) noexcept {
+        if (check_peek(seq)) return true;
+        update_commit(seq);
+        return false;
     }
 
     uint64_t get_last_seq() const noexcept { return last_seq_; }

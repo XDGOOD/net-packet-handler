@@ -5,23 +5,24 @@
 > Также доступен напрямую в репозитории: [`releases/AEGS-v6.0-titan.apk`](releases/AEGS-v6.0-titan.apk)
 
 ---
-# AEGS v4 "Pantheon" — Home & Family Edition 🏠
+# AEGS v6 "Titan" — Ultra High-Speed Stealth Protocol 🛡️⚡
 
 [![Tests](https://img.shields.io/badge/Tests-12%2F12%20Pillars%20PASS-brightgreen.svg)](#)
+[![Attacks](https://img.shields.io/badge/Defense%20Audit-12%2F12%20PASS-brightgreen.svg)](#)
 [![Language](https://img.shields.io/badge/Language-C%2B%2B17-blue.svg)](#)
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)](#)
-[![Edition](https://img.shields.io/badge/Edition-Home%20%26%20Family-blueviolet.svg)](#)
-[![Status](https://img.shields.io/badge/Status-Stable%20%26%20Frozen-success.svg)](#)
+[![Edition](https://img.shields.io/badge/Edition-v6.0%20Titan-blueviolet.svg)](#)
+[![Status](https://img.shields.io/badge/Status-Release%20Ready-success.svg)](#)
 
-> 🏠 **Это Домашняя версия (Home Edition)** проекта AEGS Pantheon — легковесный, безопасный и стабильный туннель для личного использования, семьи и друзей (до 10–50 пользователей). Кодовая база стабилизирована, закрыты все ключевые уязвимости (P0/P1) и зафиксирована для надёжной повседневной работы.
+> ⚡ **AEGS v6 Titan Edition** — ультраскоростной (300–900+ Мбит/с), криптографически стойкий и полностью невидимый для DPI туннель. Объединяет симметричные пакетные конвейеры `sendmmsg`/`recvmmsg`, поддержку Jumbo MTU (до 9000 байт), микросекундный AIMD адаптивный пейсинг, двухфазный антиреплей, динамическую мимикрию под RFC 9000/9369 QUIC и отказоустойчивый аппаратный KillSwitch.
 > 
 > 🌐 **Нужна распределённая высоконагруженная версия (10+ Гбит/с, sharded data-plane, 10k+ клиентов)?**  
-> Разработка enterprise-архитектуры ведётся в отдельном репозитории: **[AEGS Global Edition](https://github.com/XDGOOD/AEGS-Global-)**.
+> Разработка enterprise-архитектуры ведётся в репозитории: **[AEGS Global Edition](https://github.com/XDGOOD/AEGS-Global-)**.
 
 ---
 
-## 🧠 What is AEGS v4 Pantheon?
-AEGS v4 is an advanced transport protocol specifically engineered to defeat both **stateful DPI state machines** (ТСПУ, GFW, Cloudflare Magic Firewall) and **AI/ML statistical classifiers** (traffic shape analysis, timing clustering) that easily identify and block WireGuard, OpenVPN, and basic AmneziaWG obfuscations.
+## 🧠 What is AEGS v6 Titan?
+AEGS v6 Titan is an ultra high-speed transport protocol specifically engineered to defeat both **stateful DPI state machines** (ТСПУ, GFW, Cloudflare Magic Firewall) and **AI/ML statistical classifiers** (traffic shape analysis, timing clustering) that easily identify and block WireGuard, OpenVPN, and basic AmneziaWG obfuscations.
 
 ---
 
@@ -74,19 +75,22 @@ AEGS v4 is an advanced transport protocol specifically engineered to defeat both
 
 ---
 
-## 📊 Comparison Table: AEGS v4 Pantheon vs Competitors
+## 📊 Comparison Table: AEGS v6 Titan vs Competitors
 
-| Feature | WireGuard | AmneziaWG 3.1 | XTLS-Reality | **AEGS v4 Pantheon** |
+| Feature | WireGuard | AmneziaWG 3.1 | XTLS-Reality | **AEGS v6 Titan** |
 |---|---|---|---|---|
 | Static DPI signature | ❌ Static | ⚠️ Masked header | N/A (TCP only) | ✅ **Zero signatures (masked + random IV)** |
 | DPI State-Machine Bypass | ❌ None | ⚠️ Random junk (`Jc`) | ⚠️ TLS ClientHello | ✅ **Illusion (RFC 5389 STUN + RFC 9000 QUIC)** |
+| Protocol Mimicry | ❌ None | ❌ None | ⚠️ TLS Mimicry | ✅ **End-to-End QUIC Initial Evasion (RFC 9000/9369)** |
 | Anti-ML Padding | ❌ None | ⚠️ Uniform random | ❌ None | ✅ **Bimodal Semantic Shaping (~256B / ~1350B)** |
 | Anti-Timing Obfuscation | ❌ None | ❌ None | ❌ None | ✅ **Active Chaffing (PlainHDR bit 0x80)** |
-| Active Prober Defense | ❌ None | ⚠️ DNS FORMERR | ✅ TLS Camouflage | ✅ **Cryptographic Blackhole (3 QUIC strategies)** |
+| Active Prober Defense | ❌ None | ⚠️ DNS FORMERR | ✅ TLS Camouflage | ✅ **Cryptographic Blackhole (<3x Amplification)** |
 | Transport Protocol | UDP | UDP | TCP only | ✅ **UDP + Port Hopping + Mimicry** |
-| Forward Secrecy (PFS) | ✅ Noise IK | ✅ Noise IK | ✅ TLS 1.3 | ✅ **X25519 ECDH per-session** |
-| Hardware Kill-Switch | ⚠️ Client app | ⚠️ Client app | ⚠️ Client app | ✅ **Firewall Isolation + Port 53 Shield** |
-| Zero-Allocation Hot Path | ✅ | ⚠️ | ⚠️ | ✅ **Thread-local scratch buffers** |
+| Forward Secrecy (PFS) | ✅ Noise IK | ✅ Noise IK | ✅ TLS 1.3 | ✅ **X25519 ECDH per-session & 0-RTT/1-RTT Resume** |
+| Hardware Kill-Switch | ⚠️ Client app | ⚠️ Client app | ⚠️ Client app | ✅ **Fail-Closed Firewall Isolation + Port 53 Shield** |
+| Anti-Replay Protection | ⚠️ Single-phase | ⚠️ Single-phase | ✅ TLS Record | ✅ **Two-Phase Commit (Verify-Before-Commit)** |
+| Throughput & Batch Pipeline | ⚠️ Standard | ⚠️ Standard | ⚠️ Standard | ✅ **300–900+ Mbps (`sendmmsg`/`recvmmsg` zero-copy)** |
+| Jumbo MTU & Pacing | ❌ 1420B max | ❌ 1420B max | ❌ Standard | ✅ **Up to 9000B Jumbo MTU + AIMD Pacing** |
 
 ---
 

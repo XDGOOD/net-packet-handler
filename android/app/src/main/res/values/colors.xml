@@ -2,8 +2,21 @@
 <resources>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
-    <color name="bg_dark">#12141A</color>
-    <color name="card_dark">#1A1F2C</color>
-    <color name="primary_blue">#0D6EFD</color>
-    <color name="accent_green">#00D26A</color>
+    <color name="bg_obsidian">#FF0D0D10</color>
+    <color name="card_obsidian">#E017161C</color>
+    <color name="sheet_obsidian">#FF141318</color>
+    <color name="amber_primary">#FFF59E0B</color>
+    <color name="amber_secondary">#FFFB923C</color>
+    <color name="amber_accent">#FFFBBF24</color>
+    <color name="amber_glow">#48F59E0B</color>
+    <color name="text_title">#FFFFFBEB</color>
+    <color name="text_body">#FFA8A29E</color>
+    <color name="text_muted">#FF71717A</color>
+    <color name="border_card">#38F59E0B</color>
+    <color name="status_green">#FF10B981</color>
+    <color name="status_red">#FFF87171</color>
+    <color name="primary_blue">#FFF59E0B</color>
+    <color name="accent_green">#FFF59E0B</color>
+    <color name="bg_dark">#FF0D0D10</color>
+    <color name="card_dark">#E017161C</color>
 </resources>

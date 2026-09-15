@@ -1,3 +1,4 @@
+#include "safe_exec.h"
 #include "tun_interface.h"
 
 #include <iostream>
@@ -96,7 +97,7 @@ bool TunInterface::add_route(const std::string& cidr) {
         return false;
     }
     std::string cmd = "ip route add " + cidr + " dev " + iface_name_;
-    int ret = system(cmd.c_str());
+    int ret = safe_exec(cmd);
     if (ret != 0) {
         std::cerr << "Command failed: " << cmd << "\n";
         return false;
@@ -111,8 +112,8 @@ bool TunInterface::set_default_route() {
     }
     std::string cmd1 = "ip route add 0.0.0.0/1 dev " + iface_name_;
     std::string cmd2 = "ip route add 128.0.0.0/1 dev " + iface_name_;
-    int ret1 = system(cmd1.c_str());
-    int ret2 = system(cmd2.c_str());
+    int ret1 = safe_exec(cmd1);
+    int ret2 = safe_exec(cmd2);
     if (ret1 != 0 || ret2 != 0) {
         std::cerr << "Failed to set default routes\n";
         return false;
@@ -204,5 +205,13 @@ bool TunInterface::configure_interface() {
     }
 
     ::close(sock);
+
+    // High-speed line tuning (300-900+ Mbps): expand interface transmit queue to 4096 to prevent buffer overrun
+    safe_exec("ip link set dev " + iface_name_ + " txqueuelen 4096");
+
+    // Prevent TCP throughput collapse from IP fragmentation: clamp MSS to PMTU
+    safe_exec("iptables -t mangle -A FORWARD -o " + iface_name_ + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu");
+    safe_exec("iptables -t mangle -A POSTROUTING -o " + iface_name_ + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu");
+
     return true;
 }

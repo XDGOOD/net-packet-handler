@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -431,6 +432,19 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
             is_mimicked = true;
         }
 
+        auto send_reply = [&](const void* data, size_t dlen, bool mimic, const uint8_t* seed = nullptr) {
+            if (mimic) {
+                uint8_t mbuf[2048];
+                if (dlen + 24 <= sizeof(mbuf)) {
+                    std::memcpy(mbuf, data, dlen);
+                    size_t mlen = ProtocolMimicry::wrap_quic_initial(mbuf, dlen, sizeof(mbuf), seed);
+                    sendto(fd, reinterpret_cast<const char*>(mbuf), mlen, 0, (struct sockaddr*)&caddr, sizeof(caddr));
+                    return;
+                }
+            }
+            sendto(fd, reinterpret_cast<const char*>(data), dlen, 0, (struct sockaddr*)&caddr, sizeof(caddr));
+        };
+
         // =====================================================================
         // Opcode 0x04: Fast Resumption (0-RTT with per-resume derived traffic keys)
         // =====================================================================
@@ -486,6 +500,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
             sr.has_client = true;
             sr.last_server_fd = fd;
             sr.assigned_ip = assigned;
+            sr.uses_mimicry = is_mimicked || cfg.quic_mimicry;
             s->set_routing(sr);
 
             update_endpoint_cache(make_endpoint_key(ip_num, caddr.sin_port), s.get());
@@ -498,7 +513,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                 uint8_t rpkt[97];
                 rpkt[0] = OP_FAST_RESUME_RESP;
                 memcpy(rpkt + 1, &new_tok, 96);
-                sendto(fd, reinterpret_cast<const char*>(rpkt), 97, 0, (struct sockaddr*)&caddr, sizeof(caddr));
+                send_reply(rpkt, 97, is_mimicked || cfg.quic_mimicry, rtok.key_id);
             }
             metrics.resume_fast_ok.fetch_add(1, std::memory_order_relaxed);
             AegsLog::info("[FAST-RESUME] Session resumed for ", inet_ntoa(caddr.sin_addr), " (", IpPool::to_string(assigned), ")");
@@ -569,6 +584,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
             sr.has_client = true;
             sr.last_server_fd = fd;
             sr.assigned_ip = assigned;
+            sr.uses_mimicry = is_mimicked || cfg.quic_mimicry;
             s->set_routing(sr);
 
             update_endpoint_cache(make_endpoint_key(ip_num, caddr.sin_port), s.get());
@@ -582,7 +598,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
             std::memcpy(resp.server_ephemeral_pub, s_pub, 32);
             if (g_resumption.issue(s->identity.session_id, assigned, cur_c->master_key, resp.new_token, (const uint8_t*)&s->identity.key_id_raw)) {
                 ResumptionManager::compute_pfs_resp_tag(reinterpret_cast<const uint8_t*>(&resp), 1 + 32 + 96, cur_c->master_key, resp.auth_tag);
-                sendto(fd, reinterpret_cast<const char*>(&resp), sizeof(resp), 0, (struct sockaddr*)&caddr, sizeof(caddr));
+                send_reply(&resp, sizeof(resp), is_mimicked || cfg.quic_mimicry, rtok.key_id);
             }
 
             metrics.resume_pfs_ok.fetch_add(1, std::memory_order_relaxed);
@@ -645,13 +661,13 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                 nr.client_addr = caddr;
                 nr.has_client = true;
                 nr.last_server_fd = fd;
-                nr.uses_mimicry = is_mimicked;
+                nr.uses_mimicry = is_mimicked || cfg.quic_mimicry;
                 s->set_routing(nr);
 
                 // Register in O(1) fast-path cache
                 update_endpoint_cache(make_endpoint_key(ip_num, caddr.sin_port), s.get());
                 metrics.handshake_ok.fetch_add(1, std::memory_order_relaxed);
-                sendto(fd, resp.data(), resp.size(), 0, (struct sockaddr*)&caddr, sizeof(caddr));
+                send_reply(resp.data(), resp.size(), is_mimicked || cfg.quic_mimicry, (const uint8_t*)&key_id_out);
                 AegsLog::info("[HS] Client ", inet_ntoa(caddr.sin_addr), " assigned ", IpPool::to_string(new_ip));
                 
                 ResumptionToken rtok;
@@ -659,7 +675,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                     uint8_t rtok_pkt[97];
                     rtok_pkt[0] = 0x03; // RESUMPTION_TOKEN
                     memcpy(rtok_pkt + 1, &rtok, 96);
-                    sendto(fd, rtok_pkt, 97, 0, (struct sockaddr*)&caddr, sizeof(caddr));
+                    send_reply(rtok_pkt, 97, is_mimicked || cfg.quic_mimicry, (const uint8_t*)&key_id_out);
                     std::cout << "[HS] Resumption token issued for " << inet_ntoa(caddr.sin_addr) << "\n";
                 }
             } else {
@@ -732,7 +748,8 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
         if ((size_t)len < aead_offset + 12 + TAG_LEN) { record_fail(fd, caddr, pkt_data, (size_t)len, ip_num, now, 0.5); return; }
 
         const uint8_t* aead_nonce = pkt_data + aead_offset;
-        if (s->check_replay(aead_nonce)) {
+        // Two-phase anti-replay Phase 1: Read-only check before expensive decrypt (does NOT commit seq)
+        if (s->check_replay_peek(aead_nonce)) {
             metrics.replay_drop.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -751,6 +768,8 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
             metrics.decrypt_fail.fetch_add(1, std::memory_order_relaxed);
             record_fail(fd, caddr, pkt_data, (size_t)len, ip_num, now, 0.5); return;
         }
+        // Two-phase anti-replay Phase 2: Commit sequence number ONLY after Poly1305 AEAD succeeds!
+        s->commit_replay(aead_nonce);
         metrics.decrypt_ok.fetch_add(1, std::memory_order_relaxed);
 
         // Authentication passed! Securely update roaming endpoint & cache via lock-free RCU.
@@ -871,6 +890,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                 }
 #endif
             } else if (fd == tun_fd) {
+                backpressure.apply_pacing();
                 if (backpressure.should_pause_tun()) {
                     // Drain any pending outbound packets to allow socket buffers to clear
                     if (scratch.tx_count > 0) {
@@ -878,6 +898,8 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                         if (sent > 0) {
                             AegsMetrics::instance().tx_packets.fetch_add(sent, std::memory_order_relaxed);
                             backpressure.record_egress_success();
+                        } else if (scratch.tx_count > 0) {
+                            backpressure.record_egress_failure(EAGAIN);
                         }
                     }
                     continue; // Egress congested: defer reading from TUN to trigger upstream TCP flow control
@@ -975,11 +997,13 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                                 if (sent > 0) {
                                     AegsMetrics::instance().tx_packets.fetch_add(sent, std::memory_order_relaxed);
                                     backpressure.record_egress_success();
+                                } else if (scratch.tx_count > 0) {
+                                    backpressure.record_egress_failure(EAGAIN);
                                 }
                             }
                             // FIX Phase 3: Queue to symmetric sendmmsg batch pipeline
-                            if (routing->uses_mimicry) {
-                                scratch.queue_tx_mimicry(send_fd, client_addr, out_buf, out_len);
+                            if (routing->uses_mimicry || cfg.quic_mimicry) {
+                                scratch.queue_tx_mimicry(send_fd, client_addr, out_buf, out_len, (const uint8_t*)&s_key_id_raw);
                             } else {
                                 scratch.queue_tx(send_fd, client_addr, out_buf, out_len);
                             }
@@ -993,6 +1017,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                     backpressure.record_egress_success();
                 } else if (scratch.tx_count > 0) {
                     AegsMetrics::instance().egress_failures.fetch_add(1, std::memory_order_relaxed);
+                    backpressure.record_egress_failure(EAGAIN);
                 }
             }
         }
@@ -1014,8 +1039,14 @@ int main() {
     signal(SIGPIPE, SIG_IGN);
     AegsConfig cfg = AegsConfig::from_env();
     g_client_isolation = cfg.client_isolation;
+#ifndef _WIN32
+    chmod(cfg.db_path.c_str(), 0600);
+#endif
     sqlite3* db;
     if (sqlite3_open(cfg.db_path.c_str(), &db) == SQLITE_OK) {
+#ifndef _WIN32
+        chmod(cfg.db_path.c_str(), 0600);
+#endif
         sqlite3_stmt* stmt;
         if (sqlite3_prepare_v2(db, "SELECT aegis_key_id, aegis_token FROM users", -1, &stmt, NULL) == SQLITE_OK) {
             while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -1072,17 +1103,17 @@ int main() {
     
     TunInterface tun(cfg.tun_name, cfg.tun_addr(), cfg.mtu);
     if (!tun.open()) {
-        std::cerr << "[AEGS v3] Failed to create TUN interface aegs0\n";
+        std::cerr << "[AEGS v6 Titan Server] Failed to create TUN interface aegs0\n";
         return 1;
     }
-    std::cout << "[AEGS v3] TUN interface aegs0 (10.8.0.1/24) ready\n";
+    std::cout << "[AEGS v6 Titan Server] TUN interface aegs0 (10.8.0.1/24) ready\n";
 
     std::string out_iface = NatManager::detect_outbound_iface();
     NatManager nat("aegs0", out_iface, "10.8.0.0/24");
     if (!nat.setup()) {
-        std::cerr << "[AEGS v3] Warning: NAT setup failed (may need root)\n";
+        std::cerr << "[AEGS v6 Titan Server] Warning: NAT setup failed (may need root)\n";
     } else {
-        std::cout << "[AEGS v3] NAT/MASQUERADE active on " << out_iface << "\n";
+        std::cout << "[AEGS v6 Titan Server] NAT/MASQUERADE active on " << out_iface << "\n";
     }
 
     IpPool ip_pool("10.8.0.0/24");
@@ -1107,9 +1138,9 @@ int main() {
         }
     }
 
-    std::cout << "[AEGS v4 Server] Port Hopping active on ports " << cfg.base_port << "-" << (cfg.base_port + cfg.port_count - 1)
+    std::cout << "[AEGS v6 Titan Server] Port Hopping active on ports " << cfg.base_port << "-" << (cfg.base_port + cfg.port_count - 1)
               << " (" << cfg.port_count << " ports, " << cfg.hop_interval_sec << "s interval)\n";
-    std::cout << "[AEGS v4 Server] Worker threads: " << num_workers
+    std::cout << "[AEGS v6 Titan Server] Worker threads: " << num_workers
               << (num_workers > 1 ? " (SO_REUSEPORT active)" : "")
               << ", Batch size: " << cfg.recv_batch_size << "\n";
 
@@ -1141,12 +1172,12 @@ int main() {
         gc_thread.join();
     }
 
-    std::cout << "[AEGS v4 Server] Shutting down...\n";
+    std::cout << "[AEGS v6 Titan Server] Shutting down...\n";
     nat.teardown();
     tun.close();
 
     g_sessions.clear();
 
-    std::cout << "[AEGS v4 Server] Clean shutdown complete.\n";
+    std::cout << "[AEGS v6 Titan Server] Clean shutdown complete.\n";
     return 0;
 }
