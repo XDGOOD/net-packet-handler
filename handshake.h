@@ -1,11 +1,15 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
 #include <string>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
+#include <openssl/crypto.h>
 
 // FIX CRIT-5: Upper bounds for pre-authentication state to prevent DoS
 // via handshake flooding. Values chosen to allow legitimate burst traffic
@@ -27,6 +31,41 @@ struct SessionKeys {
 struct evp_pkey_st;
 typedef struct evp_pkey_st EVP_PKEY;
 
+
+// ==============================================================================
+// Stateless Handshake Cookie Generator & Validator (WireGuard / DTLS 1.3 style)
+// Defends server memory against UDP handshake spoofing & state exhaustion attacks
+// ==============================================================================
+class StatelessCookie {
+public:
+    static constexpr size_t COOKIE_LEN = 16;
+
+    static inline void generate(const uint8_t secret[32], uint32_t client_ip, uint16_t client_port, uint64_t now_sec, uint8_t cookie_out[16]) noexcept {
+        uint64_t epoch = now_sec / 20;
+        uint8_t msg[14];
+        std::memcpy(msg, &client_ip, 4);
+        std::memcpy(msg + 4, &client_port, 2);
+        std::memcpy(msg + 6, &epoch, 8);
+
+        unsigned int md_len = 0;
+        uint8_t md[EVP_MAX_MD_SIZE];
+        HMAC(EVP_sha256(), secret, 32, msg, sizeof(msg), md, &md_len);
+        std::memcpy(cookie_out, md, COOKIE_LEN);
+    }
+
+    static inline bool verify(const uint8_t secret[32], uint32_t client_ip, uint16_t client_port, uint64_t now_sec, const uint8_t cookie_in[16]) noexcept {
+        uint8_t expected[COOKIE_LEN];
+        generate(secret, client_ip, client_port, now_sec, expected);
+        if (CRYPTO_memcmp(cookie_in, expected, COOKIE_LEN) == 0) return true;
+
+        if (now_sec >= 20) {
+            generate(secret, client_ip, client_port, now_sec - 20, expected);
+            if (CRYPTO_memcmp(cookie_in, expected, COOKIE_LEN) == 0) return true;
+        }
+        return false;
+    }
+};
+
 class HandshakeClient {
 public:
     // FIX CRIT-1/CRIT-2: Takes master_key (per-user secret derived from token)
@@ -46,6 +85,25 @@ private:
     uint8_t m_key_id[8];
     uint8_t m_master_key[32]; // FIX CRIT-1: was m_server_pubkey (public, not a secret)
     EVP_PKEY* m_ephemeral_pkey;
+};
+
+struct HandshakeSeenKey {
+    uint64_t key_id{0};
+    uint64_t timestamp{0};
+
+    bool operator==(const HandshakeSeenKey& other) const noexcept {
+        return key_id == other.key_id && timestamp == other.timestamp;
+    }
+    bool operator!=(const HandshakeSeenKey& other) const noexcept {
+        return !(*this == other);
+    }
+};
+
+struct HandshakeSeenKeyHash {
+    size_t operator()(const HandshakeSeenKey& k) const noexcept {
+        uint64_t h = k.key_id ^ (k.timestamp + 0x9e3779b97f4a7c15ULL + (k.key_id << 6) + (k.key_id >> 2));
+        return static_cast<size_t>(h);
+    }
 };
 
 class HandshakeServer {
@@ -71,7 +129,7 @@ private:
     // Previously, prune_timestamps() called m_seen_timestamps.clear() every 60s,
     // which created a vulnerability window where replayed HANDSHAKE_INIT packets
     // within the 30-second window were accepted again after the wipe.
-    std::unordered_map<uint64_t, uint64_t> m_seen_timestamps;
+    std::unordered_map<HandshakeSeenKey, uint64_t, HandshakeSeenKeyHash> m_seen_timestamps;
     uint64_t m_last_prune_time;
 
     struct ClientState {

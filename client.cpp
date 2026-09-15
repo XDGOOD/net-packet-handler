@@ -17,6 +17,7 @@
 #include <openssl/kdf.h>
 #include "tun_interface.h"
 #include "handshake.h"
+#include "protocol_mimicry.h"
 #include "ip_pool.h"
 #include "illusion_prebypass.h"
 #include "chaff_engine.h"
@@ -26,18 +27,21 @@
 #include "network_security.h"
 #include "backpressure.h"
 #include "crypto_utils.h"
+#include "packet_scratch.h"
 #include <optional>
 #include <memory>
 #include <poll.h>
 
 
 size_t secure_pad_len() {
-    uint8_t b; RAND_bytes(&b, 1);
+    uint8_t b = 0;
+    if (RAND_bytes(&b, 1) != 1) return PAD_MIN;
     return PAD_MIN + (b % (PAD_MAX - PAD_MIN + 1));
 }
 
 uint16_t generate_junk_len() {
-    uint8_t b; RAND_bytes(&b, 1);
+    uint8_t b = 0;
+    if (RAND_bytes(&b, 1) != 1) return 0;
     if (b < 50) return 16 + (b % 49);
     return 0;
 }
@@ -81,9 +85,21 @@ int main(int argc, char* argv[]) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) { perror("socket"); return 1; }
 
-    int sock_buf_size = 4 * 1024 * 1024;
+    int sock_buf_size = 16 * 1024 * 1024;
+#ifdef SO_RCVBUFFORCE
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &sock_buf_size, sizeof(sock_buf_size)) < 0) {
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sock_buf_size, sizeof(sock_buf_size));
+    }
+#else
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sock_buf_size, sizeof(sock_buf_size));
+#endif
+#ifdef SO_SNDBUFFORCE
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUFFORCE, &sock_buf_size, sizeof(sock_buf_size)) < 0) {
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sock_buf_size, sizeof(sock_buf_size));
+    }
+#else
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sock_buf_size, sizeof(sock_buf_size));
+#endif
 
     if (!use_tun) {
         struct sockaddr_in l_addr {};
@@ -126,7 +142,10 @@ int main(int argc, char* argv[]) {
             close(fd);
             return 1;
         }
-        sendto(fd, init_pkt.data(), init_pkt.size(), 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
+        uint8_t mimicked_init[512];
+        std::memcpy(mimicked_init, init_pkt.data(), init_pkt.size());
+        size_t mlen = ProtocolMimicry::wrap_quic_initial(mimicked_init, init_pkt.size(), sizeof(mimicked_init));
+        sendto(fd, mimicked_init, mlen, 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
 
         struct pollfd pfd;
         pfd.fd = fd; pfd.events = POLLIN;
@@ -134,7 +153,10 @@ int main(int argc, char* argv[]) {
             struct sockaddr_in src; socklen_t slen = sizeof(src);
             std::vector<uint8_t> resp(BUFFER_SIZE);
             ssize_t len = recvfrom(fd, resp.data(), resp.size(), 0, (struct sockaddr*)&src, &slen);
-            if (len > 0 && src.sin_addr.s_addr == s_addr.sin_addr.s_addr && hc.process_resp(resp.data(), len, session_keys)) {
+            const uint8_t* resp_ptr = resp.data();
+            size_t rlen = static_cast<size_t>(len);
+            ProtocolMimicry::strip_quic_mimicry(resp_ptr, rlen);
+            if (len > 0 && src.sin_addr.s_addr == s_addr.sin_addr.s_addr && hc.process_resp(resp_ptr, rlen, session_keys)) {
                 assigned_ip = session_keys.assigned_ip;
                 mtu = session_keys.mtu;
                 handshake_ok = true;
@@ -247,112 +269,68 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // UDP fd readable
+        // UDP fd readable: high-throughput burst drain loop (300-900+ Mbps)
         if (pfds[0].revents & POLLIN) {
-            struct sockaddr_in src; socklen_t slen = sizeof(src);
-            ssize_t len = recvfrom(fd, buf.data(), buf.size(), 0, (struct sockaddr*)&src, &slen);
-            uint16_t src_port = ntohs(src.sin_port);
-            bool port_ok = (src_port >= (uint16_t)s_port && src_port < (uint16_t)(s_port + port_count));
-            if (len > 0 && src.sin_addr.s_addr == s_addr.sin_addr.s_addr && port_ok) {
-                // Check for resumption token from server
-                if (len >= 97 && buf[0] == 0x03) {
-                    memcpy(&resumption_token, buf.data() + 1, 96);
-                    has_resumption_token = true;
-                    std::cout << "[AEGS v4] Resumption token received\n";
-                    continue;
-                }
+            constexpr int CLIENT_RX_BURST = 32;
+            for (int burst = 0; burst < CLIENT_RX_BURST; ++burst) {
+                struct sockaddr_in src; socklen_t slen = sizeof(src);
+                ssize_t len = recvfrom(fd, buf.data(), buf.size(), MSG_DONTWAIT, (struct sockaddr*)&src, &slen);
+                if (len <= 0) break; // Socket buffer drained (EAGAIN / EWOULDBLOCK)
 
-                if (len < 56) continue;
+                uint16_t src_port = ntohs(src.sin_port);
+                bool port_ok = (src_port >= (uint16_t)s_port && src_port < (uint16_t)(s_port + port_count));
+                if (len > 0 && src.sin_addr.s_addr == s_addr.sin_addr.s_addr && port_ok) {
+                    uint8_t* rx_data = buf.data();
+                    size_t ulen = static_cast<size_t>(len);
+                    if (ProtocolMimicry::strip_quic_mimicry(rx_data, ulen)) {
+                        len = static_cast<ssize_t>(ulen);
+                    }
+                    // Check for resumption token from server
+                    if (len >= 97 && rx_data[0] == 0x03) {
+                        memcpy(&resumption_token, rx_data + 1, 96);
+                        has_resumption_token = true;
+                        std::cout << "[AEGS v4] Resumption token received\n";
+                        continue;
+                    }
 
-                const uint8_t* hdr_iv = buf.data();
-                uint8_t unmasked_hdr[16];
-                if (!mask_unmask_header(buf.data() + 12, 16, mask_key, hdr_iv, unmasked_hdr)) continue;
+                    if (len < 56) continue;
 
-                if (std::memcmp(unmasked_hdr, raw_kid, 8) != 0) continue;
-                if (std::memcmp(unmasked_hdr + 12, VER_MAGIC.data(), 4) != 0) continue;
+                    const uint8_t* hdr_iv = rx_data;
+                    uint8_t unmasked_hdr[16];
+                    if (!mask_unmask_header(rx_data + 12, 16, mask_key, hdr_iv, unmasked_hdr)) continue;
 
-                uint16_t junk_len = (unmasked_hdr[8] << 8) | unmasked_hdr[9];
-                size_t aead_offset = 12 + 16 + junk_len;
-                if (len < aead_offset + 12 + TAG_LEN) continue;
+                    if (std::memcmp(unmasked_hdr, raw_kid, 8) != 0) continue;
+                    if (std::memcmp(unmasked_hdr + 12, VER_MAGIC.data(), 4) != 0) continue;
 
-                const uint8_t* aead_nonce = buf.data() + aead_offset;
-                uint64_t rx_seq = 0;
-                std::memcpy(&rx_seq, aead_nonce, sizeof(uint64_t));
-                if (replay_filter.check_and_update(rx_seq)) continue;
+                    uint16_t junk_len = (unmasked_hdr[8] << 8) | unmasked_hdr[9];
+                    size_t aead_offset = 12 + 16 + junk_len;
+                    if (len < aead_offset + 12 + TAG_LEN) continue;
 
-                const uint8_t* ct = buf.data() + aead_offset + 12;
-                size_t ct_len = len - (aead_offset + 12);
+                    const uint8_t* aead_nonce = rx_data + aead_offset;
+                    uint64_t rx_seq = 0;
+                    std::memcpy(&rx_seq, aead_nonce, sizeof(uint64_t));
+                    if (replay_filter.check_and_update(rx_seq)) continue;
 
-                size_t dlen = 0;
-                // FIX Blocker 3: Authenticate outer header as AAD in AEAD Poly1305
-                if (chacha20_poly1305_decrypt(ct, ct_len, session_keys.recv_key, aead_nonce, pbuf.data(), dlen, buf.data(), aead_offset)) {
-                    transport_detector.record_success();
-                    if (dlen < 2) continue;
-                    uint16_t plen = (pbuf[0] << 8) | pbuf[1];
-                    if (plen > 0 && plen <= dlen - 2) {
-                        if (use_tun) {
-                            tun->write_packet(pbuf.data() + 2, plen);
-                        } else if (has_wg) {
-                            sendto(fd, pbuf.data() + 2, plen, 0, (struct sockaddr*)&wg_addr, sizeof(wg_addr));
+                    const uint8_t* ct = rx_data + aead_offset + 12;
+                    size_t ct_len = len - (aead_offset + 12);
+
+                    size_t dlen = 0;
+                    if (chacha20_poly1305_decrypt(ct, ct_len, session_keys.recv_key, aead_nonce, pbuf.data(), dlen, rx_data, aead_offset)) {
+                        transport_detector.record_success();
+                        if (dlen < 2) continue;
+                        uint16_t plen = (pbuf[0] << 8) | pbuf[1];
+                        if (plen > 0 && plen <= dlen - 2) {
+                            if (use_tun) {
+                                tun->write_packet(pbuf.data() + 2, plen);
+                            } else if (has_wg) {
+                                sendto(fd, pbuf.data() + 2, plen, 0, (struct sockaddr*)&wg_addr, sizeof(wg_addr));
+                            }
                         }
                     }
-                }
-            } else if (len > 0 && !use_tun) {
-                // Packet from local WireGuard
-                wg_addr = src; has_wg = true;
-                
-                size_t pad_len = shaper.semantic_pad((size_t)len);
-                size_t frame_len = FRAME_HDR + (size_t)len + pad_len;
-                if (frame_len + TAG_LEN > pbuf.size()) { pad_len = 0; frame_len = FRAME_HDR + (size_t)len; }
-                if (frame_len + TAG_LEN > pbuf.size()) continue;
-
-                uint16_t plen_be = htons((uint16_t)len);
-                std::memcpy(pbuf.data(), &plen_be, 2);
-                std::memcpy(pbuf.data() + 2, buf.data(), len);
-                if (pad_len > 0) TrafficShaper::fill_random_padding(pbuf.data() + 2 + len, pad_len);
-
-                uint8_t aead_nonce[12] = {0};
-                client_tx_seq++;
-                std::memcpy(aead_nonce, &client_tx_seq, sizeof(uint64_t));
-                RAND_bytes(aead_nonce + 8, 4);
-
-                uint16_t junk_len = generate_junk_len();
-
-                uint8_t hdr_plain[16];
-                std::memcpy(hdr_plain, raw_kid, 8);
-                hdr_plain[8] = (junk_len >> 8) & 0xFF;
-                hdr_plain[9] = junk_len & 0xFF;
-                hdr_plain[10] = 0; hdr_plain[11] = 0;
-                std::memcpy(hdr_plain + 12, VER_MAGIC.data(), 4);
-
-                uint8_t hdr_iv[12]; RAND_bytes(hdr_iv, 12);
-                uint8_t masked_hdr[16];
-                if (!mask_unmask_header(hdr_plain, 16, mask_key, hdr_iv, masked_hdr)) continue;
-
-                static thread_local std::vector<uint8_t> out_buf(BUFFER_SIZE);
-                size_t out_len = 0;
-                std::memcpy(out_buf.data(), hdr_iv, 12); out_len += 12;
-                std::memcpy(out_buf.data() + out_len, masked_hdr, 16); out_len += 16;
-                if (junk_len > 0) { RAND_bytes(out_buf.data() + out_len, (int)junk_len); out_len += junk_len; }
-                size_t aead_offset = out_len;
-                std::memcpy(out_buf.data() + out_len, aead_nonce, 12); out_len += 12;
-
-                size_t elen = 0;
-                // FIX Blocker 3: Authenticate outer header as AAD in AEAD Poly1305
-                if (!chacha20_poly1305_encrypt(pbuf.data(), frame_len, session_keys.send_key, aead_nonce, cbuf.data(), elen, out_buf.data(), aead_offset)) continue;
-                std::memcpy(out_buf.data() + out_len, cbuf.data(), elen); out_len += elen;
-
-                s_addr.sin_port = htons(hopper.current_port(session_keys.send_key));
-                sendto(fd, out_buf.data(), out_len, 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
-                chaff_engine.mark_real_packet();
-            }
-        }
-
-        // TUN fd readable
-        if (use_tun && tun && (pfds[1].revents & POLLIN)) {
-            if (!backpressure.should_pause_tun()) {
-                ssize_t len = tun->read_packet(buf.data(), buf.size());
-                if (len > 0) {
+                } else if (len > 0 && !use_tun) {
+                    // Packet from local WireGuard
+                    wg_addr = src; has_wg = true;
+                    
                     size_t pad_len = shaper.semantic_pad((size_t)len);
                     size_t frame_len = FRAME_HDR + (size_t)len + pad_len;
                     if (frame_len + TAG_LEN > pbuf.size()) { pad_len = 0; frame_len = FRAME_HDR + (size_t)len; }
@@ -366,7 +344,7 @@ int main(int argc, char* argv[]) {
                     uint8_t aead_nonce[12] = {0};
                     client_tx_seq++;
                     std::memcpy(aead_nonce, &client_tx_seq, sizeof(uint64_t));
-                    RAND_bytes(aead_nonce + 8, 4);
+                    if (RAND_bytes(aead_nonce + 8, 4) != 1) continue;
 
                     uint16_t junk_len = generate_junk_len();
 
@@ -377,7 +355,7 @@ int main(int argc, char* argv[]) {
                     hdr_plain[10] = 0; hdr_plain[11] = 0;
                     std::memcpy(hdr_plain + 12, VER_MAGIC.data(), 4);
 
-                    uint8_t hdr_iv[12]; RAND_bytes(hdr_iv, 12);
+                    uint8_t hdr_iv[12]; if (RAND_bytes(hdr_iv, 12) != 1) continue;
                     uint8_t masked_hdr[16];
                     if (!mask_unmask_header(hdr_plain, 16, mask_key, hdr_iv, masked_hdr)) continue;
 
@@ -385,23 +363,78 @@ int main(int argc, char* argv[]) {
                     size_t out_len = 0;
                     std::memcpy(out_buf.data(), hdr_iv, 12); out_len += 12;
                     std::memcpy(out_buf.data() + out_len, masked_hdr, 16); out_len += 16;
-                    if (junk_len > 0) { RAND_bytes(out_buf.data() + out_len, (int)junk_len); out_len += junk_len; }
+                    if (junk_len > 0) { if (RAND_bytes(out_buf.data() + out_len, (int)junk_len) != 1) continue; out_len += junk_len; }
                     size_t aead_offset = out_len;
                     std::memcpy(out_buf.data() + out_len, aead_nonce, 12); out_len += 12;
 
                     size_t elen = 0;
-                    // FIX Blocker 3: Authenticate outer header as AAD in AEAD Poly1305
-                    if (!chacha20_poly1305_encrypt(pbuf.data(), frame_len, session_keys.send_key, aead_nonce, cbuf.data(), elen, out_buf.data(), aead_offset)) continue;
-                    std::memcpy(out_buf.data() + out_len, cbuf.data(), elen); out_len += elen;
+                    if (!chacha20_poly1305_encrypt(pbuf.data(), frame_len, session_keys.send_key, aead_nonce, out_buf.data() + out_len, elen, out_buf.data(), aead_offset)) continue;
+                    out_len += elen;
 
                     s_addr.sin_port = htons(hopper.current_port(session_keys.send_key));
-                    ssize_t sret = sendto(fd, out_buf.data(), out_len, 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
-                    if (sret < 0) {
-                        backpressure.record_egress_failure(errno);
-                    } else {
-                        backpressure.record_egress_success();
-                    }
+                    sendto(fd, out_buf.data(), out_len, 0, (struct sockaddr*)&s_addr, sizeof(s_addr));
                     chaff_engine.mark_real_packet();
+                }
+            }
+        }
+
+        // TUN fd readable: high-speed batch read and sendmmsg pipeline (300-900+ Mbps)
+        if (use_tun && tun && (pfds[1].revents & POLLIN)) {
+            if (!backpressure.should_pause_tun()) {
+                auto& scratch = get_packet_scratch();
+                constexpr size_t CLIENT_TUN_BATCH = 32;
+                for (size_t batch = 0; batch < CLIENT_TUN_BATCH; ++batch) {
+                    ssize_t len = tun->read_packet(buf.data(), buf.size());
+                    if (len <= 0) break; // Drained / EAGAIN
+
+                    size_t pad_len = shaper.semantic_pad((size_t)len);
+                    size_t frame_len = FRAME_HDR + (size_t)len + pad_len;
+                    if (frame_len + TAG_LEN > pbuf.size()) { pad_len = 0; frame_len = FRAME_HDR + (size_t)len; }
+                    if (frame_len + TAG_LEN > pbuf.size()) continue;
+
+                    uint16_t plen_be = htons((uint16_t)len);
+                    std::memcpy(pbuf.data(), &plen_be, 2);
+                    std::memcpy(pbuf.data() + 2, buf.data(), len);
+                    if (pad_len > 0) TrafficShaper::fill_random_padding(pbuf.data() + 2 + len, pad_len);
+
+                    uint8_t aead_nonce[12] = {0};
+                    client_tx_seq++;
+                    std::memcpy(aead_nonce, &client_tx_seq, sizeof(uint64_t));
+                    if (RAND_bytes(aead_nonce + 8, 4) != 1) continue;
+
+                    uint16_t junk_len = generate_junk_len();
+
+                    uint8_t hdr_plain[16];
+                    std::memcpy(hdr_plain, raw_kid, 8);
+                    hdr_plain[8] = (junk_len >> 8) & 0xFF;
+                    hdr_plain[9] = junk_len & 0xFF;
+                    hdr_plain[10] = 0; hdr_plain[11] = 0;
+                    std::memcpy(hdr_plain + 12, VER_MAGIC.data(), 4);
+
+                    uint8_t hdr_iv[12]; if (RAND_bytes(hdr_iv, 12) != 1) continue;
+                    uint8_t masked_hdr[16];
+                    if (!mask_unmask_header(hdr_plain, 16, mask_key, hdr_iv, masked_hdr)) continue;
+
+                    size_t out_len = 0;
+                    std::memcpy(scratch.tx_buf, hdr_iv, 12); out_len += 12;
+                    std::memcpy(scratch.tx_buf + out_len, masked_hdr, 16); out_len += 16;
+                    if (junk_len > 0) { if (RAND_bytes(scratch.tx_buf + out_len, (int)junk_len) != 1) continue; out_len += junk_len; }
+                    size_t aead_offset = out_len;
+                    std::memcpy(scratch.tx_buf + out_len, aead_nonce, 12); out_len += 12;
+
+                    size_t elen = 0;
+                    if (!chacha20_poly1305_encrypt(pbuf.data(), frame_len, session_keys.send_key, aead_nonce, scratch.tx_buf + out_len, elen, scratch.tx_buf, aead_offset)) continue;
+                    out_len += elen;
+
+                    s_addr.sin_port = htons(hopper.current_port(session_keys.send_key));
+                    scratch.queue_tx_mimicry(fd, s_addr, scratch.tx_buf, out_len);
+                    chaff_engine.mark_real_packet();
+                }
+                size_t sent = scratch.flush_tx();
+                if (sent > 0) {
+                    backpressure.record_egress_success();
+                } else if (scratch.tx_count > 0) {
+                    backpressure.record_egress_failure(EAGAIN);
                 }
             }
         }

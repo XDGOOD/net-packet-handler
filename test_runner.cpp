@@ -1,3 +1,6 @@
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <iostream>
 #include <vector>
 #include <string>
@@ -18,6 +21,7 @@
 #include <arpa/inet.h>
 #endif
 
+#include "port_hopper.h"
 #include "traffic_shaper.h"
 #include "illusion_prebypass.h"
 #include "chaff_engine.h"
@@ -26,6 +30,7 @@
 #include "network_security.h"
 #include "crypto_utils.h"
 #include "session_resumption.h"
+#include "handshake.h"
 
 
 double calculate_entropy(const uint8_t* data, size_t len) {
@@ -44,7 +49,7 @@ double calculate_entropy(const uint8_t* data, size_t len) {
 
 int main() {
     std::cout << "=================================================================" << std::endl;
-    std::cout << "      AEGS v2 ADVANCED 5-PILLAR SECURITY & RELIABILITY SUITE     " << std::endl;
+    std::cout << "  AEGS Global Protocol Test Suite (v5 Pantheon / 12-Pillar)      " << std::endl;
     std::cout << "=================================================================" << std::endl;
 
     std::string token = "prod_user_token_long_entropy_test_2026_safe";
@@ -69,10 +74,10 @@ int main() {
     // -------------------------------------------------------------
     std::cout << "\n[PILLAR 2] DPI SIGNATURE SCAN & SHANNON ENTROPY..." << std::endl;
     std::string simulated_wg_pkt(148, 0);
-    RAND_bytes((uint8_t*)simulated_wg_pkt.data(), 148);
+    assert(RAND_bytes((uint8_t*)simulated_wg_pkt.data(), 148) == 1);
     
     uint8_t hdr_iv[12];
-    RAND_bytes(hdr_iv, 12);
+    assert(RAND_bytes(hdr_iv, 12) == 1);
     uint8_t clear_hdr[16];
     std::memcpy(clear_hdr, "KID1", 4);
     uint16_t junk_len = 48;
@@ -85,20 +90,21 @@ int main() {
     assert(mask_unmask_header(clear_hdr, 16, mask_key, hdr_iv, masked_hdr));
 
     std::vector<uint8_t> junk(junk_len);
-    RAND_bytes(junk.data(), junk_len);
+    assert(RAND_bytes(junk.data(), junk_len) == 1);
 
     size_t pad_len = 64;
     std::vector<uint8_t> plain(FRAME_HDR + simulated_wg_pkt.size() + pad_len);
     uint16_t orig_len = htons((uint16_t)simulated_wg_pkt.size());
     std::memcpy(plain.data(), &orig_len, FRAME_HDR);
     std::memcpy(plain.data() + FRAME_HDR, simulated_wg_pkt.data(), simulated_wg_pkt.size());
-    RAND_bytes(plain.data() + FRAME_HDR + simulated_wg_pkt.size(), (int)pad_len);
+    assert(RAND_bytes(plain.data() + FRAME_HDR + simulated_wg_pkt.size(), (int)pad_len) == 1);
 
     uint8_t payload_nonce[12];
-    RAND_bytes(payload_nonce, 12);
+    assert(RAND_bytes(payload_nonce, 12) == 1);
     std::vector<uint8_t> encrypted_payload(plain.size() + TAG_LEN);
     size_t enc_len = 0;
-    assert(chacha20_poly1305_encrypt(plain.data(), plain.size(), payload_key, payload_nonce, encrypted_payload.data(), enc_len));
+    bool enc_ok = chacha20_poly1305_encrypt(plain.data(), plain.size(), payload_key, payload_nonce, encrypted_payload.data(), enc_len);
+    assert(enc_ok && enc_len > 0);
 
     std::vector<uint8_t> wire_packet;
     wire_packet.insert(wire_packet.end(), hdr_iv, hdr_iv + 12);
@@ -153,18 +159,30 @@ int main() {
     int tamper_blocked = 0;
     for (int flip = 0; flip < 50; ++flip) {
         std::vector<uint8_t> tampered_packet = wire_packet;
-        // Corrupt single bit in ciphertext or tag
+        if (enc_len == 0) {
+            std::cerr << "  [CRITICAL] enc_len == 0 before tamper flip=" << flip << std::endl;
+            break;
+        }
         size_t corrupt_pos = 12 + 16 + junk_len + 12 + (flip % enc_len);
+        if (corrupt_pos >= tampered_packet.size()) {
+            std::cerr << "  [CRITICAL] corrupt_pos out of bounds: " << corrupt_pos << " >= " << tampered_packet.size() << std::endl;
+            break;
+        }
         tampered_packet[corrupt_pos] ^= 0x01; // flip 1 bit
 
         const uint8_t* s_nonce = tampered_packet.data() + 12 + 16 + junk_len;
         const uint8_t* s_ct = s_nonce + 12;
         size_t s_ct_len = tampered_packet.size() - (12 + 16 + junk_len + 12);
 
-        std::vector<uint8_t> dec_out(s_ct_len);
+        std::vector<uint8_t> dec_out(s_ct_len + 64, 0);
         size_t dec_out_len = 0;
         bool dec_success = chacha20_poly1305_decrypt(s_ct, s_ct_len, payload_key, s_nonce, dec_out.data(), dec_out_len);
-        if (!dec_success) {
+        if (dec_success) {
+            std::cerr << "  [FAIL] UNEXPECTED AUTH SUCCESS at flip=" << flip
+                      << " corrupt_pos=" << corrupt_pos
+                      << " ct_len=" << s_ct_len
+                      << " dec_out_len=" << dec_out_len << std::endl;
+        } else {
             tamper_blocked++;
         }
     }
@@ -178,7 +196,7 @@ int main() {
     int fallback_counter = 0;
     for (int i = 0; i < 5000; ++i) {
         uint8_t probe_bytes[128];
-        RAND_bytes(probe_bytes, 128);
+        assert(RAND_bytes(probe_bytes, 128) == 1);
         uint8_t unmask_test[16];
         mask_unmask_header(probe_bytes + 12, 16, mask_key, probe_bytes, unmask_test);
         if (std::memcmp(unmask_test + 8, VER_MAGIC.data(), 4) != 0) {
@@ -303,15 +321,19 @@ int main() {
     // -------------------------------------------------------------
     std::cout << "\n[PILLAR 8] ACTIVE CHAFFING & SILENT DROP VERIFICATION..." << std::endl;
     ChaffEngine chaff(50, 10, 20); // 50ms idle threshold, 10-20ms chaff interval
-    assert(!chaff.should_send_chaff()); // Not idle yet
+    auto t0 = std::chrono::steady_clock::now();
+    chaff.mark_real_packet(t0);
+    assert(!chaff.should_send_chaff(t0)); // Not idle yet (elapsed = 0ms)
 
-    // Wait for idle timeout
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    assert(chaff.should_send_chaff());
+    // Deterministic simulated clock test (eliminates flaky sleep & OS scheduler jitter)
+    auto t1 = t0 + std::chrono::milliseconds(55); // > 50ms idle threshold
+    chaff.should_send_chaff(t1); // Enters idle state and schedules next chaff
+    auto t2 = t1 + std::chrono::milliseconds(25); // > max 20ms interval
+    assert(chaff.should_send_chaff(t2)); // Triggered deterministically
 
     // Reset with real packet activity
-    chaff.mark_real_packet();
-    assert(!chaff.should_send_chaff());
+    chaff.mark_real_packet(t2);
+    assert(!chaff.should_send_chaff(t2 + std::chrono::milliseconds(5)));
 
     // Build and verify chaff wire packet
     uint8_t test_raw_kid[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
@@ -334,7 +356,7 @@ int main() {
     size_t chaff_ct_len = chaff_wire.size() - (12 + 16 + 12);
     std::vector<uint8_t> chaff_pt(chaff_ct_len);
     size_t chaff_pt_len = 0;
-    assert(chacha20_poly1305_decrypt(chaff_ct, chaff_ct_len, payload_key, chaff_nonce, chaff_pt.data(), chaff_pt_len));
+    assert(chacha20_poly1305_decrypt(chaff_ct, chaff_ct_len, payload_key, chaff_nonce, chaff_pt.data(), chaff_pt_len, chaff_wire.data(), 12 + 16));
     uint16_t real_payload_len = (chaff_pt[0] << 8) | chaff_pt[1];
     assert(real_payload_len == 0); // Zero bytes payload - server drops cleanly!
     std::cout << "  [PASS] Chaff Idle Engine: Timing-driven generation verified" << std::endl;
@@ -405,7 +427,7 @@ int main() {
     uint8_t pkt_buf2[256] = {0};
     uint8_t seed[2] = {0xAA, 0xBB};
     size_t w1 = pm.wrap(pkt_buf1, 32, sizeof(pkt_buf1), seed);
-    size_t w2 = ProtocolMimicry::wrap_quic_initial(pkt_buf2, 32, sizeof(pkt_buf2));
+    size_t w2 = ProtocolMimicry::wrap_quic_initial(pkt_buf2, 32, sizeof(pkt_buf2), nullptr, 0);
     assert(w1 == 32 + 24);
     assert(w2 == 32 + 24);
     assert(pm.header_size() == 24);
@@ -417,6 +439,33 @@ int main() {
     static const uint8_t old_static_sig[6] = {0xC0, 0x00, 0x00, 0x00, 0x01, 0x08};
     assert(std::memcmp(pkt_buf1, old_static_sig, 6) != 0 || std::memcmp(pkt_buf2, old_static_sig, 6) != 0);
     std::cout << "  [PASS] Protocol Mimicry: RFC 9000 Randomized CIDs & Dynamic Versions Verified" << std::endl;
+
+    // Verify ProtocolMimicry is_quic_mimicry and strip_quic_mimicry zero-copy unwrap
+    assert(ProtocolMimicry::is_quic_mimicry(pkt_buf1, w1));
+    assert(ProtocolMimicry::is_quic_mimicry(pkt_buf2, w2));
+    uint8_t non_mimic[100] = {0x01, 0x02, 0x03};
+    assert(!ProtocolMimicry::is_quic_mimicry(non_mimic, 100));
+
+    uint8_t* strip_ptr = pkt_buf1;
+    size_t strip_len = w1;
+    assert(ProtocolMimicry::strip_quic_mimicry(strip_ptr, strip_len));
+    assert(strip_len == 32);
+    assert(strip_ptr == pkt_buf1 + 24);
+
+    // Verify StatelessCookie generation and verification
+    uint8_t cookie_sec[32] = {0x42};
+    uint8_t cookie1[16];
+    uint32_t cookie_test_ip = 0x01020304;
+    uint16_t cookie_test_port = 54321;
+    uint64_t now_ts = 1700000000ULL;
+    StatelessCookie::generate(cookie_sec, cookie_test_ip, cookie_test_port, now_ts, cookie1);
+    assert(StatelessCookie::verify(cookie_sec, cookie_test_ip, cookie_test_port, now_ts, cookie1));
+    assert(StatelessCookie::verify(cookie_sec, cookie_test_ip, cookie_test_port, now_ts + 15, cookie1)); // Same 20s epoch
+    assert(StatelessCookie::verify(cookie_sec, cookie_test_ip, cookie_test_port, now_ts + 25, cookie1)); // Next epoch (within grace period)
+    assert(!StatelessCookie::verify(cookie_sec, cookie_test_ip + 1, cookie_test_port, now_ts, cookie1)); // Different IP fails
+    assert(!StatelessCookie::verify(cookie_sec, cookie_test_ip, cookie_test_port + 1, now_ts, cookie1)); // Different port fails
+    assert(!StatelessCookie::verify(cookie_sec, cookie_test_ip, cookie_test_port, now_ts + 100, cookie1)); // Expired epoch fails
+    std::cout << "  [PASS] StatelessCookie: Anti-DDoS HMAC-SHA256 Token Validation Verified" << std::endl;
 
     // 4. PortHopper window and server-side valid port verification
     PortHopper hopper_test(51820, 8, 30);
@@ -435,7 +484,7 @@ int main() {
     ResumptionManager rm;
     ResumptionToken rtok;
     uint8_t dummy_master[32];
-    RAND_bytes(dummy_master, 32);
+    assert(RAND_bytes(dummy_master, 32) == 1);
     uint8_t dummy_kid[8] = {'U', 'S', 'E', 'R', '1', '2', '3', '4'};
     uint64_t test_sid = 0xAABBCCDDEEFF0011ULL;
     uint32_t test_ip = 0x0A080005;

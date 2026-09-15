@@ -46,6 +46,43 @@ public:
 
     static constexpr size_t kQuicHeaderSize = 24;
 
+    // Checks whether an incoming buffer contains a valid RFC 9000 QUIC mimicry header
+    static inline bool is_quic_mimicry(const uint8_t* buf, size_t len) noexcept {
+        if (!buf || len < kQuicHeaderSize) return false;
+        uint8_t b0 = buf[0];
+        if ((b0 & 0x80) == 0) return false; // Must be Long Header
+        if (buf[5] != 0x08 || buf[14] != 0x08 || buf[23] != 0x00) return false;
+
+        uint32_t version = (static_cast<uint32_t>(buf[1]) << 24) |
+                           (static_cast<uint32_t>(buf[2]) << 16) |
+                           (static_cast<uint32_t>(buf[3]) << 8)  |
+                            static_cast<uint32_t>(buf[4]);
+
+        return (version == kQuicVersion1 || version == kQuicVersion2 ||
+                version == kQuicDraft29  || version == kQuicDraft32  ||
+                version == kQuicVerNeg);
+    }
+
+    // In-place zero-copy unwrap: advances pointer past QUIC header and reduces len
+    static inline bool strip_quic_mimicry(const uint8_t*& buf, size_t& len) noexcept {
+        if (is_quic_mimicry(buf, len)) {
+            buf += kQuicHeaderSize;
+            len -= kQuicHeaderSize;
+            return true;
+        }
+        return false;
+    }
+
+    static inline bool strip_quic_mimicry(uint8_t*& buf, size_t& len) noexcept {
+        if (is_quic_mimicry(buf, len)) {
+            buf += kQuicHeaderSize;
+            len -= kQuicHeaderSize;
+            return true;
+        }
+        return false;
+    }
+
+
     explicit ProtocolMimicry(Mode mode = Mode::NONE, uint32_t quic_version = 0) noexcept;
 
     // Direct helper to wrap a buffer with an RFC 9000 QUIC Initial header with randomized
@@ -58,13 +95,6 @@ public:
                                     const uint8_t  session_seed[2] = nullptr,
                                     uint32_t       quic_version = 0) noexcept;
 
-    // Member function alias matching wrap_quic_initial naming from audit
-    size_t wrap_quic_initial(uint8_t*       buf,
-                             size_t         data_len,
-                             size_t         buf_capacity,
-                             const uint8_t  session_seed[2] = nullptr) noexcept {
-        return wrap(buf, data_len, buf_capacity, session_seed);
-    }
 
     // Prepend the mimicry header in-place.
     // The caller MUST ensure buf_capacity >= data_len + header_size_.

@@ -41,7 +41,7 @@ size_t ProtocolMimicry::wrap_quic_initial(uint8_t*       buf,
     std::memmove(buf + kQuicHeaderSize, buf, data_len);
 
     uint8_t rand_bytes[18];
-    RAND_bytes(rand_bytes, sizeof(rand_bytes));
+    if (RAND_bytes(rand_bytes, sizeof(rand_bytes)) != 1) return data_len;
 
     // Dynamic Version Selection per RFC 9000 / RFC 9369
     uint32_t version = quic_version;
@@ -115,3 +115,6 @@ size_t ProtocolMimicry::wrap(uint8_t*       buf,
 
     return wrap_quic_initial(buf, data_len, buf_capacity, session_seed, v);
 }
+
+
+// ---------------------------------------------------------------------------
