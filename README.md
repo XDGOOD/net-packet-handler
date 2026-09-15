@@ -1,3 +1,10 @@
+# AEGS v6 "Titan" — Ultra High-Speed Stealth Protocol (300-900+ Mbps)
+
+## 📱 [СКАЧАТЬ AEGS ДЛЯ ANDROID (APK)](https://github.com/XDGOOD/net-packet-handler/releases/download/v6.0-titan/AEGS-v6.0-titan.apk)
+> 🚀 **Нативный Android APK (5.18 МБ):** [AEGS-v6.0-titan.apk](https://github.com/XDGOOD/net-packet-handler/releases/download/v6.0-titan/AEGS-v6.0-titan.apk)  
+> Также доступен напрямую в репозитории: [`releases/AEGS-v6.0-titan.apk`](releases/AEGS-v6.0-titan.apk)
+
+---
 # AEGS v4 "Pantheon" — Home & Family Edition 🏠
 
 [![Tests](https://img.shields.io/badge/Tests-12%2F12%20Pillars%20PASS-brightgreen.svg)](#)
