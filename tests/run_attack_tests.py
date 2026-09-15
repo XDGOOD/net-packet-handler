@@ -498,17 +498,24 @@ class AttackTestSuite:
 
     def test_10_file_permissions_audit(self):
         print(f"\n{Colors.BOLD}--- ATTACK TEST 10: File System & Key Permissions Audit ---{Colors.RESET}")
-        with open("scripts/init_db.sh", "r", encoding="utf-8", errors="ignore") as f:
-            init_db_content = f.read()
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if os.path.basename(os.path.dirname(os.path.abspath(__file__))) == "tests" else os.path.abspath(".")
+        
+        def find_file(rel_paths):
+            for p in rel_paths:
+                full = os.path.join(repo_root, p)
+                if os.path.exists(full):
+                    with open(full, "r", encoding="utf-8", errors="ignore") as f:
+                        return f.read()
+            return ""
+
+        init_db_content = find_file(["scripts/init_db.sh", "init_db.sh"])
         has_chmod_700 = "chmod 700" in init_db_content
         has_chmod_600 = "chmod 600" in init_db_content
 
-        with open("server.cpp", "r", encoding="utf-8", errors="ignore") as f:
-            server_content = f.read()
+        server_content = find_file(["src/server.cpp", "server.cpp"])
         server_chmod_db = "chmod(cfg.db_path.c_str(), 0600)" in server_content
 
-        with open("handshake.cpp", "r", encoding="utf-8", errors="ignore") as f:
-            hs_content = f.read()
+        hs_content = find_file(["src/crypto/handshake.cpp", "handshake.cpp"])
         hs_chmod_key = "chmod(path.c_str(), 0600)" in hs_content
 
         passed = has_chmod_700 and has_chmod_600 and server_chmod_db and hs_chmod_key
@@ -520,13 +527,21 @@ class AttackTestSuite:
 
     def test_11_jumbo_mtu_clamping(self):
         print(f"\n{Colors.BOLD}--- ATTACK TEST 11: Jumbo MTU & Buffer Safety Audit ---{Colors.RESET}")
-        with open("packet_scratch.h", "r", encoding="utf-8", errors="ignore") as f:
-            ps_content = f.read()
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if os.path.basename(os.path.dirname(os.path.abspath(__file__))) == "tests" else os.path.abspath(".")
+        
+        def find_file(rel_paths):
+            for p in rel_paths:
+                full = os.path.join(repo_root, p)
+                if os.path.exists(full):
+                    with open(full, "r", encoding="utf-8", errors="ignore") as f:
+                        return f.read()
+            return ""
+
+        ps_content = find_file(["src/core/packet_scratch.h", "packet_scratch.h"])
         has_jumbo_slot = "TX_SLOT_SIZE = 9216" in ps_content
         has_oversized_drop = "dropped_oversized" in ps_content
 
-        with open("aegs_config.h", "r", encoding="utf-8", errors="ignore") as f:
-            cfg_content = f.read()
+        cfg_content = find_file(["include/aegs/config.h", "aegs_config.h"])
         has_mtu_clamp = "c.mtu < 576" in cfg_content and "c.mtu > 9000" in cfg_content
 
         passed = has_jumbo_slot and has_oversized_drop and has_mtu_clamp

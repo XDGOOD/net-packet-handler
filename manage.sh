@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🛡️ AEGS v2 Protocol - Root CLI Wrapper
+# 🛡️ AEGS v6 Titan Protocol - Root CLI Wrapper
 # Forwards execution to scripts/manage.sh
 # ==============================================================================
 set -euo pipefail

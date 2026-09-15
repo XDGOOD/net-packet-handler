@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # =============================================================================
-# AEGS Protocol v5 "Pantheon" Global Edition - Production Dockerfile
+# AEGS Protocol v6 "Titan" Edition - Production Dockerfile
 # Base: Alpine Linux 3.20 (musl libc, hardened security, unprivileged execution)
 # =============================================================================
 
@@ -28,9 +28,9 @@ RUN cmake -B build \
 # Stage 2: Minimal Hardened Runtime
 FROM alpine:3.20
 
-LABEL org.opencontainers.image.title="AEGS Protocol v5 Global Server" \
-      org.opencontainers.image.description="Carrier-grade, sharded, multi-core UDP tunnel protocol" \
-      org.opencontainers.image.version="5.0.0" \
+LABEL org.opencontainers.image.title="AEGS Protocol v6 Titan Server" \
+      org.opencontainers.image.description="Ultra high-speed, stealth UDP tunnel protocol" \
+      org.opencontainers.image.version="6.0.0" \
       org.opencontainers.image.authors="AEGS Protocol Team" \
       org.opencontainers.image.licenses="MIT"
 

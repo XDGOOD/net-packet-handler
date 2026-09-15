@@ -1,6 +1,6 @@
 # AEGS v4 'Pantheon' -- Отчет об атаках и безопасности
 
-**Дата аудита:** 2026-09-15 19:16:09
+**Дата аудита:** 2026-09-15 19:31:42
 **Результат:** **12/12 тестов пройдено (100% PASS)**
 
 ## Резюме решения проблем из `предложение.txt`:
@@ -37,7 +37,7 @@
 - **Результат:** Short probes response length: 0B (Factor = 0.0x), Rate-limiting ceiling: 50 pkts / 8192 B
 
 ### ✅ PASS Тест 6.1: O(1) Fast-Path Session Lookup Benchmarked
-- **Результат:** Latency per packet lookup: 151.23 ns (< 1000 ns target), Scales to 1000+ sessions without O(N) linear penalty
+- **Результат:** Latency per packet lookup: 160.97 ns (< 1000 ns target), Scales to 1000+ sessions without O(N) linear penalty
 
 ### ✅ PASS Тест 7.1: Database Token Protection (Zero-Plaintext Storage)
 - **Результат:** Plaintext token absent from storage: True, SHA-256 hash verified: f64b5ecadcb5e654...

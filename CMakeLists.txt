@@ -5,7 +5,15 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/aegs
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/crypto
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/stealth
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/net
+)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2 -std=c++17")
 
@@ -64,45 +72,60 @@ if(NOT SQLITE3_FOUND)
     endif()
 endif()
 
-# Shared sources
-set(CORE_SOURCES
-    port_hopper.cpp
-    protocol_mimicry.cpp
-    traffic_shaper.cpp
-    chaff_engine.cpp
-    illusion_prebypass.cpp
-    blackhole_responder.cpp
-    network_security.cpp
+# Shared modular sources
+set(STEALTH_SOURCES
+    src/stealth/port_hopper.cpp
+    src/stealth/protocol_mimicry.cpp
+    src/stealth/traffic_shaper.cpp
+    src/stealth/chaff_engine.cpp
+    src/stealth/illusion_prebypass.cpp
+    src/stealth/blackhole_responder.cpp
 )
 
-# 1. Main Carrier-Grade Server
-add_executable(aegs_server server.cpp tun_interface.cpp handshake.cpp ip_pool.cpp nat_manager.cpp ${CORE_SOURCES})
+set(NET_SOURCES
+    src/net/network_security.cpp
+    src/net/tun_interface.cpp
+    src/net/ip_pool.cpp
+    src/net/nat_manager.cpp
+)
+
+set(CRYPTO_SOURCES
+    src/crypto/handshake.cpp
+)
+
+set(CORE_SOURCES
+    ${STEALTH_SOURCES}
+    ${NET_SOURCES}
+    ${CRYPTO_SOURCES}
+)
+
+# 1. Main Server
+add_executable(aegs_server src/server.cpp ${CORE_SOURCES})
 if(SQLITE3_INCLUDE_DIRS)
     target_include_directories(aegs_server PRIVATE ${SQLITE3_INCLUDE_DIRS})
 endif()
 target_link_libraries(aegs_server PRIVATE OpenSSL::Crypto ${SQLITE3_LIBRARIES} Threads::Threads)
 
 # 2. Client
-add_executable(aegs_client client.cpp tun_interface.cpp handshake.cpp ip_pool.cpp nat_manager.cpp ${CORE_SOURCES})
+add_executable(aegs_client src/client.cpp ${CORE_SOURCES})
 target_link_libraries(aegs_client PRIVATE OpenSSL::Crypto Threads::Threads)
 
 # 3. Test Runner
-add_executable(aegs_test test_runner.cpp tun_interface.cpp handshake.cpp ip_pool.cpp nat_manager.cpp ${CORE_SOURCES})
+add_executable(aegs_test tests/unit/test_runner.cpp ${CORE_SOURCES})
 target_link_libraries(aegs_test PRIVATE OpenSSL::Crypto Threads::Threads)
 
-# 4. Stage 26 Benchmark Suite
-add_executable(bench_hotpath benchmarks/bench_hotpath.cpp ${CORE_SOURCES})
+# 4. Benchmark Suite
+add_executable(bench_hotpath tests/benchmarks/bench_hotpath.cpp ${STEALTH_SOURCES} src/net/network_security.cpp)
 target_link_libraries(bench_hotpath PRIVATE OpenSSL::Crypto Threads::Threads)
 
-# 5. Stage 23 Protocol Fuzz Target
-add_executable(aegs_fuzz fuzzing/fuzz_parsers.cpp ${CORE_SOURCES})
+# 5. Protocol Fuzz Target
+add_executable(aegs_fuzz tests/fuzz/fuzz_parsers.cpp ${STEALTH_SOURCES} src/net/network_security.cpp)
 target_link_libraries(aegs_fuzz PRIVATE OpenSSL::Crypto Threads::Threads)
 
-# 6. Concurrency Stress Test Suite (TSAN Validation)
-add_executable(test_concurrency_stress tests/test_concurrency_stress.cpp handshake.cpp ip_pool.cpp ${CORE_SOURCES})
+# 6. Concurrency Stress Test Suite
+add_executable(test_concurrency_stress tests/test_concurrency_stress.cpp src/crypto/handshake.cpp src/net/ip_pool.cpp ${STEALTH_SOURCES} src/net/network_security.cpp)
 target_link_libraries(test_concurrency_stress PRIVATE OpenSSL::Crypto Threads::Threads)
 
-
-# 7. Multicore Scaling & Capacity Benchmark
-add_executable(bench_multicore benchmarks/bench_multicore.cpp handshake.cpp ip_pool.cpp ${CORE_SOURCES})
+# 7. Multicore Scaling Benchmark
+add_executable(bench_multicore tests/benchmarks/bench_multicore.cpp src/crypto/handshake.cpp src/net/ip_pool.cpp ${STEALTH_SOURCES} src/net/network_security.cpp)
 target_link_libraries(bench_multicore PRIVATE OpenSSL::Crypto Threads::Threads)

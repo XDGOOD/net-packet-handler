@@ -136,11 +136,11 @@ jobs:
 
       - name: Run 12-Pillar Advanced Security Suite
         run: |
-          python test_suite_v4.py
+          python tests/test_suite_v4.py
 
-      - name: Run Attack Defense Verification Harness (9/9)
+      - name: Run Attack Defense Verification Harness (12/12)
         run: |
-          python run_attack_tests.py
+          python tests/run_attack_tests.py
 
       - name: Run Network Chaos Simulator (5/5 Fail-Closed)
         run: |
