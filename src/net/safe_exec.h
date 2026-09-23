@@ -80,7 +80,7 @@ inline int safe_exec(const std::string& cmd_str) noexcept {
             in_quotes = !in_quotes;
         } else if (std::isspace(static_cast<unsigned char>(c)) && !in_quotes) {
             if (!cur.empty()) {
-                if (cur == ">/dev/null" || cur == "2>&1") {
+                if (cur == ">/dev/null" || cur == "2>&1" || cur == "2>/dev/null" || cur == "1>/dev/null") {
                     suppress_output = true;
                 } else {
                     tokens.push_back(cur);
@@ -92,7 +92,7 @@ inline int safe_exec(const std::string& cmd_str) noexcept {
         }
     }
     if (!cur.empty()) {
-        if (cur == ">/dev/null" || cur == "2>&1") {
+        if (cur == ">/dev/null" || cur == "2>&1" || cur == "2>/dev/null" || cur == "1>/dev/null") {
             suppress_output = true;
         } else {
             tokens.push_back(cur);

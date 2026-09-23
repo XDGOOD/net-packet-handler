@@ -84,7 +84,7 @@ const size_t MAX_BANNED_RECORDS = 10000;
 std::unordered_map<uint32_t, FailRecord> failed_attempts;
 std::atomic<size_t> g_failed_attempts_count{0};
 std::unordered_map<uint32_t, double> banned_ips;
-const int ban_levels[] = {0, 30, 300, 3600};
+const int ban_levels[] = {0, 10, 30, 60};
 std::mutex security_mu;
 std::mutex tun_write_mu;
 
@@ -267,7 +267,7 @@ void record_fail(int fd, const struct sockaddr_in& caddr,
             g_failed_attempts_count.store(failed_attempts.size(), std::memory_order_relaxed);
             do_fallback = true;
 
-            if (rec.weight >= 10.0) {
+            if (rec.weight >= 30.0) {
                 int lvl = std::min(rec.level, 3);
                 if (banned_ips.size() < MAX_BANNED_RECORDS || banned_ips.find(ip_num) != banned_ips.end()) {
                     banned_ips[ip_num] = now + ban_levels[lvl];
@@ -424,12 +424,15 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
             if (ban_it != banned_ips.end() && now < ban_it->second) return;
         }
 
-        // DPI Mimicry Evasion: detect and strip RFC 9000 QUIC header if present
+        // DPI Mimicry Evasion: detect and strip RFC 9000 QUIC or TLS 1.3 Reality ECH if present
         bool is_mimicked = false;
         size_t ulen = static_cast<size_t>(len);
         if (ProtocolMimicry::strip_quic_mimicry(pkt_data, ulen)) {
             len = static_cast<ssize_t>(ulen);
             is_mimicked = true;
+        } else if (ProtocolMimicry::strip_tls_reality_mimicry(pkt_data, ulen)) {
+            len = static_cast<ssize_t>(ulen);
+            is_mimicked = false;
         }
 
         auto send_reply = [&](const void* data, size_t dlen, bool mimic, const uint8_t* seed = nullptr) {
@@ -640,7 +643,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                 g_sessions.map_ip(new_ip, s.get());
                 
                 SessionKeys sk;
-                auto resp = hs_server.build_resp(key_id_out, new_ip, 1400, sk);
+                auto resp = hs_server.build_resp(key_id_out, new_ip, 1360, sk);
 
                 s->identity.generation.fetch_add(1, std::memory_order_release);
                 s->identity.session_id = sk.session_id;
@@ -737,8 +740,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
         if (ports.size() > 1 && matched_crypto->v3_handshake_done) {
             auto pit = fd_to_port.find(fd);
             if (pit != fd_to_port.end() && !hopper.is_valid_port(matched_crypto->session_keys.recv_key, pit->second)) {
-                // Packet arrived on an invalid port for this session's hopping epoch
-                record_fail(fd, caddr, pkt_data, (size_t)len, ip_num, now, 0.5);
+                // Packet arrived on an unexpected port during rotation: silently drop without IP ban
                 return;
             }
         }
@@ -816,8 +818,12 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                                            (uint32_t(inner_pkt[14]) << 8)  |
                                             uint32_t(inner_pkt[15]);
                     auto cur_r = s->get_routing();
-                    if (cur_r && cur_r->assigned_ip != 0 && inner_src_ip != cur_r->assigned_ip) {
-                        return; // Drop: source IP spoofing attempt
+                    if (cur_r && cur_r->assigned_ip != 0) {
+                        uint32_t exp_ip = cur_r->assigned_ip;
+                        uint32_t exp_bswap = __builtin_bswap32(exp_ip);
+                        if (inner_src_ip != exp_ip && inner_src_ip != exp_bswap) {
+                            return; // Drop: source IP spoofing attempt
+                        }
                     }
                 }
             }
@@ -917,6 +923,7 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
 
                     // FIX Phase 2: Sharded O(1) IP route lookup using safe SessionHandle
                     SessionHandle s = g_sessions.find_by_assigned_ip(dst_ip);
+                    if (!s) s = g_sessions.find_by_assigned_ip(__builtin_bswap32(dst_ip));
                     if (!s) continue;
 
                     // FIX Client Isolation: Drop inter-client traffic when isolation enabled

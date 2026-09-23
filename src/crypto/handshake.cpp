@@ -313,7 +313,8 @@ bool HandshakeServer::process_init(const uint8_t* init, size_t len, uint64_t& ke
     uint64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     
-    if (now < ts || now - ts > 30000) return false; // 30 seconds
+    int64_t diff = static_cast<int64_t>(now) - static_cast<int64_t>(ts);
+    if (diff < -60000 || diff > 60000) return false; // ±60 seconds clock skew window for mobile networks
 
     std::lock_guard<std::mutex> lock(m_mutex);
     prune_timestamps(now);
@@ -339,9 +340,11 @@ bool HandshakeServer::process_init(const uint8_t* init, size_t len, uint64_t& ke
     }
 
     HandshakeSeenKey seen_key{key_id_out, ts};
-    if (m_seen_timestamps.find(seen_key) != m_seen_timestamps.end()) return false;
-    m_seen_timestamps[seen_key] = now;
-    m_seen_order.emplace_back(seen_key, now);
+    bool is_retransmit = (m_seen_timestamps.find(seen_key) != m_seen_timestamps.end());
+    if (!is_retransmit) {
+        m_seen_timestamps[seen_key] = now;
+        m_seen_order.emplace_back(seen_key, now);
+    }
 
     // Free any stale ephemeral key from a previous abandoned handshake for this key_id
     auto existing = m_pending_clients.find(key_id_out);
@@ -418,10 +421,10 @@ std::vector<uint8_t> HandshakeServer::build_resp(uint64_t key_id, uint32_t assig
     // session_id, server_ephemeral_pub) so any tampering with the server ephemeral
     // key or session ID causes AEAD tag verification failure.
     uint8_t plain_config[16] = {0};
-    plain_config[0] = assigned_ip & 0xFF;
-    plain_config[1] = (assigned_ip >> 8) & 0xFF;
-    plain_config[2] = (assigned_ip >> 16) & 0xFF;
-    plain_config[3] = (assigned_ip >> 24) & 0xFF;
+    plain_config[0] = (assigned_ip >> 24) & 0xFF;
+    plain_config[1] = (assigned_ip >> 16) & 0xFF;
+    plain_config[2] = (assigned_ip >> 8) & 0xFF;
+    plain_config[3] = assigned_ip & 0xFF;
     plain_config[4] = mtu & 0xFF;
     plain_config[5] = (mtu >> 8) & 0xFF;
 
