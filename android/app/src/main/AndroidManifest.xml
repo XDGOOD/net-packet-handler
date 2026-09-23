@@ -5,12 +5,20 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
 
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
-        android:label="AEGS"
-        android:roundIcon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.AEGS">
 
@@ -35,6 +43,18 @@
             android:exported="false"
             android:screenOrientation="portrait" />
 
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="Настройки"
+            android:parentActivityName=".MainActivity" />
+
+        <activity
+            android:name=".AppRoutingActivity"
+            android:exported="false"
+            android:label="Выбор приложений"
+            android:parentActivityName=".SettingsActivity" />
+
         <service
             android:name=".AegsVpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"
@@ -48,7 +68,7 @@
         <service
             android:name=".AegsTileService"
             android:icon="@mipmap/ic_launcher"
-            android:label="AEGS Titan"
+            android:label="AEGS VPN"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
             android:exported="true">
             <intent-filter>

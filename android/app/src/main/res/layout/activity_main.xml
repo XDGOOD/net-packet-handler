@@ -4,13 +4,12 @@
     android:layout_height="match_parent"
     android:background="#0D0D10">
 
-    <!-- Native Dynamic Wave Background Circles -->
+    <!-- Ambient Floating Translucent Amber Circles (Hardware Accelerated, Zero GC) -->
     <com.aegs.titan.WaveCirclesBackgroundView
-        android:id="@+id/wave_bg"
+        android:id="@+id/bg_wave_circles"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <!-- Foreground UI -->
     <ScrollView
         android:layout_width="match_parent"
         android:layout_height="match_parent"
@@ -20,274 +19,536 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:padding="20dp">
+            android:paddingStart="20dp"
+            android:paddingEnd="20dp"
+            android:paddingTop="20dp"
+            android:paddingBottom="28dp">
 
-            <!-- Header -->
+            <!-- Top Header Bar -->
             <RelativeLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginBottom="12dp">
+                android:layout_marginBottom="14dp">
 
                 <LinearLayout
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:orientation="vertical">
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
 
-                    <TextView
+                    <ImageView
+                        android:layout_width="44dp"
+                        android:layout_height="44dp"
+                        android:src="@drawable/app_icon"
+                        android:layout_marginEnd="12dp" />
+
+                    <LinearLayout
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="AEGS TITAN"
-                        android:textColor="#FFFBEB"
-                        android:textSize="20sp"
-                        android:textStyle="bold" />
+                        android:orientation="vertical">
 
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="v6.2 • RFC 9000 QUIC Stealth"
-                        android:textColor="#F59E0B"
-                        android:textSize="11sp" />
+                        <LinearLayout
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:orientation="horizontal"
+                            android:gravity="center_vertical">
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:text="AEGS VPN"
+                                android:textColor="#FFFBEB"
+                                android:textSize="20sp"
+                                android:textStyle="bold" />
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:text="TITAN"
+                                android:textColor="#F59E0B"
+                                android:textSize="10sp"
+                                android:textStyle="bold"
+                                android:background="#1FF59E0B"
+                                android:paddingLeft="6dp"
+                                android:paddingRight="6dp"
+                                android:paddingTop="2dp"
+                                android:paddingBottom="2dp"
+                                android:layout_marginStart="8dp" />
+                        </LinearLayout>
+
+                        <TextView
+                            android:id="@+id/tv_proto_badge"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="v6.5   Chrome 128+ Reality ECH"
+                            android:textColor="#F59E0B"
+                            android:textSize="11.5sp"
+                            android:textStyle="bold" />
+                    </LinearLayout>
                 </LinearLayout>
 
                 <LinearLayout
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_alignParentEnd="true"
-                    android:orientation="horizontal">
+                    android:layout_centerVertical="true"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
 
-                    <Button
-                        android:id="@+id/btn_open_add_source"
-                        android:layout_width="40dp"
-                        android:layout_height="40dp"
-                        android:text="+"
-                        android:textColor="#FFFBEB"
-                        android:textSize="18sp"
-                        android:backgroundTint="#241E1C24"
-                        android:layout_marginEnd="8dp" />
 
-                    <Button
-                        android:id="@+id/btn_open_settings"
-                        android:layout_width="40dp"
-                        android:layout_height="40dp"
-                        android:text="⚙"
-                        android:textColor="#FFFBEB"
-                        android:textSize="16sp"
-                        android:backgroundTint="#241E1C24" />
+
+                    <ImageView
+                        android:id="@+id/btn_settings"
+                        android:layout_width="36dp"
+                        android:layout_height="36dp"
+                        android:src="@drawable/ic_settings"
+                        android:background="@drawable/card_obsidian"
+                        android:padding="8dp"
+                        android:tint="#B3FFB300"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:contentDescription="Настройки" />
                 </LinearLayout>
             </RelativeLayout>
 
-            <!-- Update Banner -->
-            <LinearLayout
-                android:id="@+id/banner_update"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:background="#2AF59E0B"
-                android:padding="8dp"
-                android:orientation="horizontal"
-                android:gravity="center_vertical"
-                android:layout_marginBottom="12dp"
-                android:visibility="gone">
-
-                <TextView
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="✓ AEGS Titan v6.2 актуален"
-                    android:textColor="#FFFBEB"
-                    android:textSize="11sp"
-                    android:textStyle="bold" />
-
-                <TextView
-                    android:id="@+id/btn_close_banner"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="✕"
-                    android:textColor="#A8A29E"
-                    android:padding="4dp" />
-            </LinearLayout>
-
-            <!-- Status Pill -->
+            <!-- Status Pill Badge -->
             <TextView
                 android:id="@+id/tv_status"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_gravity="center_horizontal"
-                android:text="● Отключено"
+                android:text="ТРЕБУЕТСЯ КЛЮЧ ДОСТУПА"
                 android:textColor="#F87171"
-                android:textSize="12sp"
+                android:textSize="12.5sp"
                 android:textStyle="bold"
-                android:background="#14FFFFFF"
-                android:paddingLeft="14dp"
-                android:paddingRight="14dp"
-                android:paddingTop="4dp"
-                android:paddingBottom="4dp"
-                android:layout_marginBottom="14dp" />
+                android:background="#1C1917"
+                android:paddingLeft="16dp"
+                android:paddingRight="16dp"
+                android:paddingTop="6dp"
+                android:paddingBottom="6dp"
+                android:layout_marginBottom="16dp" />
 
-            <!-- Big Connect Button (Where wave line forms!) -->
+            <!-- ============================================================= -->
+            <!-- STATE 1: NO KEY CONFIGURED CARD                               -->
+            <!-- ============================================================= -->
+            <LinearLayout
+                android:id="@+id/card_no_key"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/card_obsidian"
+                android:orientation="vertical"
+                android:padding="18dp"
+                android:layout_marginBottom="16dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="12dp">
+
+                    <ImageView
+                        android:layout_width="32dp"
+                        android:layout_height="32dp"
+                        android:src="@drawable/ic_key"
+                        android:tint="@color/amber_primary"
+                        android:layout_marginEnd="12dp" />
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Требуется ключ доступа"
+                            android:textColor="#FFFBEB"
+                            android:textSize="16sp"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="AEGS Titan Crypto Key"
+                            android:textColor="#F59E0B"
+                            android:textSize="11sp" />
+                    </LinearLayout>
+                </LinearLayout>
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Для подключения к зашифрованной сети AEGS v6 Titan необходим персональный ключ доступа. Оформите подписку в Telegram-боте @aegs_support_bot всего от 100 руб/мес (до 4 устройств одновременно)."
+                    android:textColor="#D4D4D8"
+                    android:textSize="13sp"
+                    android:lineSpacingExtra="2dp"
+                    android:layout_marginBottom="16dp" />
+
+                <!-- Prominent Action: Open Telegram Bot -->
+                <Button
+                    android:id="@+id/btn_buy_bot"
+                    android:layout_width="match_parent"
+                    android:layout_height="50dp"
+                    android:text="КУПИТЬ / ПОЛУЧИТЬ КЛЮЧ В БОТЕ"
+                    android:textColor="#18181B"
+                    android:textSize="13.5sp"
+                    android:textStyle="bold"
+                    android:background="@drawable/btn_amber_gradient"
+                    android:layout_marginBottom="14dp" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Или вставьте уже полученный ключ / aegs:// ссылку:"
+                    android:textColor="#A8A29E"
+                    android:textSize="12sp"
+                    android:layout_marginBottom="8dp" />
+
+                <EditText
+                    android:id="@+id/et_access_key"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="aegs://31.76.9.86:50001/... или токен"
+                    android:textColor="#FFFBEB"
+                    android:textColorHint="#71717A"
+                    android:background="@drawable/bg_input_rounded"
+                    android:padding="12dp"
+                    android:textSize="13sp"
+                    android:fontFamily="monospace"
+                    android:singleLine="true"
+                    android:layout_marginBottom="10dp" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
+
+                    <Button
+                        android:id="@+id/btn_paste_key"
+                        android:layout_width="0dp"
+                        android:layout_height="42dp"
+                        android:layout_weight="1"
+                        android:text="Вставить из буфера"
+                        android:textColor="#F59E0B"
+                        android:textSize="12sp"
+                        android:textStyle="bold"
+                        android:background="@drawable/card_obsidian"
+                        android:layout_marginEnd="6dp" />
+
+                    <Button
+                        android:id="@+id/btn_activate_key"
+                        android:layout_width="0dp"
+                        android:layout_height="42dp"
+                        android:layout_weight="1"
+                        android:text="Активировать ключ"
+                        android:textColor="#18181B"
+                        android:textSize="12sp"
+                        android:textStyle="bold"
+                        android:background="@drawable/bg_btn_amber"
+                        android:layout_marginStart="6dp" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- ============================================================= -->
+            <!-- STATE 2: ACTIVE KEY SUMMARY CARD                              -->
+            <!-- ============================================================= -->
+            <LinearLayout
+                android:id="@+id/card_active_key"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/card_obsidian"
+                android:orientation="vertical"
+                android:padding="16dp"
+                android:visibility="gone"
+                android:layout_marginBottom="16dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="8dp">
+
+                    <ImageView
+                        android:layout_width="22dp"
+                        android:layout_height="22dp"
+                        android:src="@drawable/ic_shield"
+                        android:tint="@color/amber_primary"
+                        android:layout_marginEnd="8dp" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="КЛЮЧ ДОСТУПА АКТИВЕН"
+                        android:textColor="#34D399"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/tv_active_key_id"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="KeyID: ●●●●●●●●"
+                    android:textColor="#FFFBEB"
+                    android:textSize="13sp"
+                    android:fontFamily="monospace"
+                    android:layout_marginBottom="4dp" />
+
+                <TextView
+                    android:id="@+id/tv_active_server"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Сервер: 31.76.9.86:50001 (AEGS Titan-01)"
+                    android:textColor="#A8A29E"
+                    android:textSize="12sp"
+                    android:layout_marginBottom="12dp" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
+
+                    <Button
+                        android:id="@+id/btn_change_key"
+                        android:layout_width="0dp"
+                        android:layout_height="38dp"
+                        android:layout_weight="1"
+                        android:text="Сменить ключ"
+                        android:textColor="#D4D4D8"
+                        android:textSize="11.5sp"
+                        android:background="@drawable/card_obsidian"
+                        android:layout_marginEnd="6dp" />
+
+                    <Button
+                        android:id="@+id/btn_renew_bot"
+                        android:layout_width="0dp"
+                        android:layout_height="38dp"
+                        android:layout_weight="1"
+                        android:text="Продлить в боте"
+                        android:textColor="#F59E0B"
+                        android:textSize="11.5sp"
+                        android:textStyle="bold"
+                        android:background="@drawable/card_obsidian"
+                        android:layout_marginStart="6dp" />
+                </LinearLayout>
+
+                <Button
+                    android:id="@+id/btn_share_key"
+                    android:layout_width="match_parent"
+                    android:layout_height="40dp"
+                    android:text="📤 Поделиться ключом (до 4 устройств)"
+                    android:textColor="#261102"
+                    android:textSize="12sp"
+                    android:textStyle="bold"
+                    android:background="@drawable/btn_amber_gradient"
+                    android:layout_marginTop="10dp" />
+            </LinearLayout>
+
+            <!-- Big Circular Connect Button (Shown ONLY when Key is Active!) -->
             <LinearLayout
                 android:id="@+id/btn_connect_circle"
-                android:layout_width="148dp"
-                android:layout_height="148dp"
+                android:layout_width="152dp"
+                android:layout_height="152dp"
                 android:layout_gravity="center_horizontal"
-                android:background="#E617161C"
+                android:background="@drawable/btn_connect_circle"
                 android:orientation="vertical"
                 android:gravity="center"
                 android:clickable="true"
                 android:focusable="true"
+                android:visibility="gone"
                 android:layout_marginBottom="20dp">
+
+                <ImageView
+                    android:id="@+id/iv_conn_shield"
+                    android:layout_width="28dp"
+                    android:layout_height="28dp"
+                    android:src="@drawable/ic_shield"
+                    android:tint="@color/amber_primary" />
 
                 <TextView
                     android:id="@+id/tv_conn_label"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="ПОДКЛЮЧИТЬ"
+                    android:text="ПОДКЛЮЧИТЬСЯ"
                     android:textColor="#FFFBEB"
                     android:textSize="13sp"
-                    android:textStyle="bold" />
+                    android:textStyle="bold"
+                    android:layout_marginTop="4dp" />
 
                 <TextView
                     android:id="@+id/tv_conn_sub"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Готов?"
+                    android:text="Готов к защите"
                     android:textColor="#F59E0B"
-                    android:textSize="11sp"
+                    android:textSize="11.5sp"
                     android:textStyle="bold"
                     android:layout_marginTop="2dp" />
             </LinearLayout>
 
-            <!-- Shortcuts Row (Protocol & Apps) -->
+            <!-- Telemetry & Live Bezier Metrics Graph Card -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:layout_marginBottom="12dp">
-
-                <LinearLayout
-                    android:id="@+id/btn_shortcut_settings"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:background="#E617161C"
-                    android:padding="12dp"
-                    android:layout_marginEnd="6dp"
-                    android:orientation="vertical">
-
-                    <TextView
-                        android:id="@+id/lbl_protocol"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="QUIC v6"
-                        android:textColor="#FFFBEB"
-                        android:textSize="13sp"
-                        android:textStyle="bold" />
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="AEGS DoH"
-                        android:textColor="#A8A29E"
-                        android:textSize="11sp" />
-                </LinearLayout>
-
-                <LinearLayout
-                    android:id="@+id/btn_shortcut_apps"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:background="#E617161C"
-                    android:padding="12dp"
-                    android:layout_marginStart="6dp"
-                    android:orientation="vertical">
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="Приложения"
-                        android:textColor="#FFFBEB"
-                        android:textSize="13sp"
-                        android:textStyle="bold" />
-
-                    <TextView
-                        android:id="@+id/lbl_apps_count"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="4 через VPN"
-                        android:textColor="#A8A29E"
-                        android:textSize="11sp" />
-                </LinearLayout>
-            </LinearLayout>
-
-            <!-- Telemetry Card -->
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:background="#E617161C"
-                android:padding="14dp"
+                android:background="@drawable/card_obsidian"
                 android:orientation="vertical"
+                android:padding="14dp"
                 android:layout_marginBottom="12dp">
 
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="ТЕЛЕМЕТРИЯ КАНАЛА"
-                    android:textColor="#A8A29E"
-                    android:textSize="10sp"
-                    android:textStyle="bold"
-                    android:layout_marginBottom="6dp" />
+                <RelativeLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="ТЕЛЕМЕТРИЯ СЕТИ"
+                        android:textColor="#A8A29E"
+                        android:textSize="11sp"
+                        android:textStyle="bold"
+                        android:letterSpacing="0.05" />
+
+                    <TextView
+                        android:id="@+id/tv_speed"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_alignParentEnd="true"
+                        android:text="LTO TURBO 940 Мбит/с"
+                        android:textColor="#F59E0B"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+                </RelativeLayout>
 
                 <TextView
                     android:id="@+id/tv_ping"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Пинг: -- мс"
-                    android:textColor="#F59E0B"
-                    android:textSize="13sp"
-                    android:textStyle="bold" />
-
-                <TextView
-                    android:id="@+id/tv_speed"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Скорость: 0.0 Мбит/с"
+                    android:text="Пинг к серверу: -- мс"
                     android:textColor="#FFFBEB"
                     android:textSize="13sp"
-                    android:layout_marginTop="3dp" />
+                    android:textStyle="bold"
+                    android:layout_marginTop="6dp" />
+
+                <!-- Live Obsidian & Amber Bezier Latency / Jitter Graph -->
+                <com.aegs.titan.LiveMetricsGraphView
+                    android:id="@+id/metrics_graph"
+                    android:layout_width="match_parent"
+                    android:layout_height="110dp"
+                    android:layout_marginTop="10dp" />
             </LinearLayout>
 
-            <!-- Active Server Card -->
+            <!-- Split Tunneling Card -->
             <LinearLayout
+                android:id="@+id/card_split_tunneling"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:background="#E617161C"
+                android:background="@drawable/card_obsidian"
+                android:orientation="vertical"
                 android:padding="14dp"
-                android:orientation="vertical">
+                android:layout_marginBottom="12dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <CheckBox
+                        android:id="@+id/cb_split"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="Умный обход (Split-Tunneling)"
+                        android:textColor="#F59E0B"
+                        android:textSize="14sp"
+                        android:textStyle="bold"
+                        android:checked="true" />
+
+                    <TextView
+                        android:id="@+id/btn_configure_apps"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Настроить ⚙️"
+                        android:textColor="#34D399"
+                        android:textSize="12sp"
+                        android:textStyle="bold"
+                        android:background="@drawable/card_obsidian"
+                        android:paddingStart="8dp"
+                        android:paddingEnd="8dp"
+                        android:paddingTop="4dp"
+                        android:paddingBottom="4dp"
+                        android:clickable="true"
+                        android:focusable="true" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/tv_split_status"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Банки РФ, Госуслуги, Ozon, WB работают напрямую в обход VPN."
+                    android:textColor="#A8A29E"
+                    android:textSize="12sp"
+                    android:layout_marginTop="4dp" />
+            </LinearLayout>
+
+            <!-- Prominent Settings Section Card (Unmissable!) -->
+            <LinearLayout
+                android:id="@+id/card_open_settings"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/card_obsidian"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:padding="16dp"
+                android:clickable="true"
+                android:focusable="true"
+                android:layout_marginTop="4dp"
+                android:layout_marginBottom="12dp">
+
+                <ImageView
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:src="@drawable/ic_settings"
+                    android:background="@drawable/btn_connect_circle"
+                    android:tint="#F59E0B"
+                    android:alpha="0.9"
+                    android:padding="9dp"
+                    android:contentDescription="Настройки" />
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical"
+                    android:layout_marginStart="14dp">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Параметры и протоколы"
+                        android:textColor="#FFFBEB"
+                        android:textSize="15sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Reality ECH, Kill-Switch, Режимы обхода, Сертификаты"
+                        android:textColor="#A8A29E"
+                        android:textSize="12sp"
+                        android:layout_marginTop="2dp" />
+                </LinearLayout>
 
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="АКТИВНЫЙ УЗЕЛ"
-                    android:textColor="#A8A29E"
-                    android:textSize="10sp"
+                    android:text="›"
+                    android:textColor="#F59E0B"
+                    android:textSize="18sp"
                     android:textStyle="bold" />
-
-                <TextView
-                    android:id="@+id/tv_active_server"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="AEGS Cloud — Нидерланды"
-                    android:textColor="#FFFBEB"
-                    android:textSize="14sp"
-                    android:textStyle="bold"
-                    android:layout_marginTop="2dp" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="IP: 185.196.8.10:50001 (QUIC UDP)"
-                    android:textColor="#A8A29E"
-                    android:textSize="11sp"
-                    android:layout_marginTop="1dp" />
             </LinearLayout>
 
         </LinearLayout>

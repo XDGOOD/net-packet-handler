@@ -1,22 +1,52 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="black">#FF000000</color>
-    <color name="white">#FFFFFFFF</color>
-    <color name="bg_obsidian">#FF0D0D10</color>
-    <color name="card_obsidian">#E017161C</color>
-    <color name="sheet_obsidian">#FF141318</color>
-    <color name="amber_primary">#FFF59E0B</color>
-    <color name="amber_secondary">#FFFB923C</color>
-    <color name="amber_accent">#FFFBBF24</color>
-    <color name="amber_glow">#48F59E0B</color>
-    <color name="text_title">#FFFFFBEB</color>
-    <color name="text_body">#FFA8A29E</color>
-    <color name="text_muted">#FF71717A</color>
-    <color name="border_card">#38F59E0B</color>
-    <color name="status_green">#FF10B981</color>
-    <color name="status_red">#FFF87171</color>
-    <color name="primary_blue">#FFF59E0B</color>
-    <color name="accent_green">#FFF59E0B</color>
-    <color name="bg_dark">#FF0D0D10</color>
-    <color name="card_dark">#E017161C</color>
+    <!-- Base Theme Colors -->
+    <color name="bg_main">#0D0D10</color>
+    <color name="bg_card">#17161C</color>
+    <color name="bg_sheet">#141318</color>
+    <color name="border_card">#47F59E0B</color>
+    <color name="border_subtle">#14FFFFFF</color>
+    <color name="primary">#F59E0B</color>
+    <color name="primary_dark">#D97706</color>
+    <color name="secondary">#FB923C</color>
+    <color name="accent">#FBBF24</color>
+    <color name="text_title">#FFFBEB</color>
+    <color name="text_body">#A8A29E</color>
+    <color name="text_muted">#71717A</color>
+    <color name="btn_text">#261102</color>
+
+    <!-- Obsidian Palette (Day/Base) -->
+    <color name="obsidian_base">#0D0D10</color>
+    <color name="obsidian_bg">#F5F6F9</color>
+    <color name="obsidian_surface">#FFFFFF</color>
+    <color name="obsidian_surface_elevated">#EDEDF2</color>
+    <color name="obsidian_surface_glass">#F0FFFFFF</color>
+    <color name="obsidian_card_stroke">#E2E5EC</color>
+    <color name="obsidian_border">#D1D5DB</color>
+
+    <!-- Amber Palette -->
+    <color name="amber_primary">#FFB300</color>
+    <color name="amber_dark">#FF8F00</color>
+    <color name="amber_light">#FFF8E1</color>
+    <color name="amber_accent">#FFA000</color>
+    <color name="amber_glow">#33FFB300</color>
+    <color name="amber_glow_strong">#55FF8F00</color>
+    <color name="amber_ripple">#44FFB300</color>
+
+    <!-- Text & Content -->
+    <color name="text_primary">#111318</color>
+    <color name="text_secondary">#5A6474</color>
+    <color name="text_tertiary">#8C95A6</color>
+    <color name="text_on_amber">#0A0C10</color>
+
+    <!-- Status -->
+    <color name="status_connected">#00C853</color>
+    <color name="status_connected_glow">#3300C853</color>
+    <color name="status_connecting">#FFB300</color>
+    <color name="status_disconnected">#EF4444</color>
+    <color name="status_disconnected_glow">#33EF4444</color>
+
+    <!-- Translucent Elements -->
+    <color name="icon_translucent">#99202530</color>
+    <color name="card_glass_tint">#0D000000</color>
 </resources>
