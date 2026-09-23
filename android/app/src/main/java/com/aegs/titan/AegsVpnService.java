@@ -329,7 +329,8 @@ public class AegsVpnService extends VpnService implements Runnable {
             builder.setSession("AEGS Titan (" + mSession.assignedIp + ")");
             builder.addAddress(mSession.assignedIp, 24);
             builder.addDnsServer("10.8.0.1"); // Enforce tunnel DNS to prevent leaks
-            builder.addDnsServer("1.1.1.1");
+            builder.addDnsServer("8.8.8.8");
+            builder.addDnsServer("77.88.8.8");
             builder.addRoute("0.0.0.0", 0);
             builder.setMtu(Math.min(mSession.mtu, 1280));
 
@@ -387,9 +388,11 @@ public class AegsVpnService extends VpnService implements Runnable {
                                     "ya.ru", "yandex.ru", "kinopoisk.ru", "ozon.ru", "wildberries.ru"
                             ));
                         }
+                        java.util.concurrent.ExecutorService dnsExecutor = java.util.concurrent.Executors.newSingleThreadExecutor();
                         for (String domain : bypassDomains) {
                             try {
-                                InetAddress[] addrs = InetAddress.getAllByName(domain);
+                                java.util.concurrent.Future<InetAddress[]> future = dnsExecutor.submit(() -> InetAddress.getAllByName(domain));
+                                InetAddress[] addrs = future.get(350, java.util.concurrent.TimeUnit.MILLISECONDS);
                                 for (InetAddress addr : addrs) {
                                     if (addr instanceof Inet4Address) {
                                         builder.excludeRoute(new IpPrefix(addr, 32));
@@ -397,9 +400,10 @@ public class AegsVpnService extends VpnService implements Runnable {
                                     }
                                 }
                             } catch (Exception e) {
-                                Log.w(TAG, "[AEGS] Could not resolve bypass domain " + domain + ": " + e.getMessage());
+                                Log.w(TAG, "[AEGS] Skipping slow/unresolved bypass domain: " + domain);
                             }
                         }
+                        dnsExecutor.shutdown();
                     } catch (Exception e) {
                         Log.w(TAG, "[AEGS] Failed to configure domain route exclusion: " + e.getMessage());
                     }
@@ -469,7 +473,7 @@ public class AegsVpnService extends VpnService implements Runnable {
                         udpBuf.get(rawPacket);
 
                         byte[] plainIp = AegsProtocol.parseDataPacket(
-                                rawPacket, readBytes, mSession.keyId, mSession.maskKey, mSession.recvKey);
+                                rawPacket, readBytes, mSession.keyId, mSession.maskKey, mSession.altMaskKey, mSession.recvKey);
 
                         if (plainIp != null) {
                             if (plainIp.length > 0) {

@@ -35,6 +35,8 @@ struct SessionIdentity {
 struct SessionCrypto {
     uint8_t     master_key[32]{};
     uint8_t     mask_key[32]{};
+    uint8_t     alt_mask_key[32]{};
+    bool        has_alt_mask_key = false;
     SessionKeys session_keys;       // ECDH-derived directional keys (recv/send)
     bool        v3_handshake_done = false;
 };
@@ -48,6 +50,7 @@ struct SessionRouting {
     bool               has_client = false;
     int                last_server_fd = -1;
     bool               uses_mimicry = false; // RFC 9000 QUIC DPI camouflage active
+    bool               uses_alt_mask = false; // Dual-compatibility with "aegs-v2-header-mask" clients
 };
 
 // ---------------------------------------------------------------------------

@@ -698,12 +698,21 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
         // RCU / Copy-On-Write SessionCrypto snapshot lookup (Zero data races with concurrent Handshakes/Resumes)
         uint64_t ep_key = make_endpoint_key(ip_num, caddr.sin_port);
         SessionHandle fast_sess = g_sessions.find_by_endpoint(ep_key);
+        bool used_alt_mask = false;
         if (fast_sess) {
             auto fc = fast_sess->get_crypto();
             if (fc && mask_unmask_header(pkt_data + 12, 16, fc->mask_key, hdr_iv, unmasked_hdr)) {
                 if (std::memcmp(unmasked_hdr, &fast_sess->identity.key_id_raw, 8) == 0 && std::memcmp(unmasked_hdr + 12, VER_MAGIC.data(), 4) == 0) {
                     matched_sess = std::move(fast_sess);
                     matched_crypto = fc;
+                    used_alt_mask = false;
+                }
+            }
+            if (!matched_sess && fc && fc->has_alt_mask_key && mask_unmask_header(pkt_data + 12, 16, fc->alt_mask_key, hdr_iv, unmasked_hdr)) {
+                if (std::memcmp(unmasked_hdr, &fast_sess->identity.key_id_raw, 8) == 0 && std::memcmp(unmasked_hdr + 12, VER_MAGIC.data(), 4) == 0) {
+                    matched_sess = std::move(fast_sess);
+                    matched_crypto = fc;
+                    used_alt_mask = true;
                 }
             }
         }
@@ -721,6 +730,14 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                 if (mask_unmask_header(pkt_data + 12, 16, sc->mask_key, hdr_iv, unmasked_hdr)) {
                     if (std::memcmp(unmasked_hdr, &s->identity.key_id_raw, 8) == 0 && std::memcmp(unmasked_hdr + 12, VER_MAGIC.data(), 4) == 0) {
                         matched_crypto = sc;
+                        used_alt_mask = false;
+                        return true;
+                    }
+                }
+                if (sc->has_alt_mask_key && mask_unmask_header(pkt_data + 12, 16, sc->alt_mask_key, hdr_iv, unmasked_hdr)) {
+                    if (std::memcmp(unmasked_hdr, &s->identity.key_id_raw, 8) == 0 && std::memcmp(unmasked_hdr + 12, VER_MAGIC.data(), 4) == 0) {
+                        matched_crypto = sc;
+                        used_alt_mask = true;
                         return true;
                     }
                 }
@@ -781,12 +798,14 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
             if (!cur_r || !cur_r->has_client ||
                 cur_r->client_addr.sin_addr.s_addr != caddr.sin_addr.s_addr ||
                 cur_r->client_addr.sin_port != caddr.sin_port ||
-                cur_r->last_server_fd != fd) {
+                cur_r->last_server_fd != fd ||
+                cur_r->uses_alt_mask != used_alt_mask) {
                 SessionRouting nr = cur_r ? *cur_r : SessionRouting{};
                 nr.client_addr = caddr;
                 nr.has_client = true;
                 nr.last_server_fd = fd;
                 nr.uses_mimicry = is_mimicked;
+                nr.uses_alt_mask = used_alt_mask;
                 s->set_routing(nr);
             }
             s->counters.last_activity.store(now, std::memory_order_relaxed);
@@ -950,7 +969,11 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
                     auto routing = s->get_routing();
                     if (!routing || !routing->has_client || routing->last_server_fd < 0) continue;
 
-                    std::memcpy(s_mask_key, sc->mask_key, 32);
+                    if (routing->uses_alt_mask && sc->has_alt_mask_key) {
+                        std::memcpy(s_mask_key, sc->alt_mask_key, 32);
+                    } else {
+                        std::memcpy(s_mask_key, sc->mask_key, 32);
+                    }
                     std::memcpy(enc_key, sc->session_keys.send_key, 32);
                     client_addr = routing->client_addr;
                     send_fd = routing->last_server_fd;
@@ -1072,15 +1095,21 @@ int main() {
                 std::string token = (const char*)sqlite3_column_text(stmt, 1);
                 uint8_t mkey[32];
                 uint8_t msk[32];
+                uint8_t alt_msk[32];
                 if (!derive_master_key(token, s->identity.key_id_hex, mkey) ||
                     !hkdf_expand(mkey, 32, "aegis-v2-header-mask", msk, 32)) {
                     std::cerr << "key derivation / HKDF failed for " << s->identity.key_id_hex << "\n";
                     delete s;
                     continue;
                 }
+                bool has_alt = hkdf_expand(mkey, 32, "aegs-v2-header-mask", alt_msk, 32);
                 SessionCrypto init_sc;
                 std::memcpy(init_sc.master_key, mkey, 32);
                 std::memcpy(init_sc.mask_key, msk, 32);
+                if (has_alt) {
+                    std::memcpy(init_sc.alt_mask_key, alt_msk, 32);
+                    init_sc.has_alt_mask_key = true;
+                }
                 init_sc.v3_handshake_done = false;
                 s->set_crypto(init_sc);
                 g_sessions.insert_session(s);

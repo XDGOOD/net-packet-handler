@@ -51,6 +51,7 @@ public final class AegsProtocol {
         public byte[] sendKey; // C2S_Key
         public byte[] recvKey; // S2C_Key
         public byte[] maskKey;
+        public byte[] altMaskKey;
         public byte[] keyId;
     }
 
@@ -498,10 +499,11 @@ public final class AegsProtocol {
         byte[] sharedSecret = x25519ScalarMult(clientPriv, serverEphemeralPub);
 
         // Derive session keys per PROTOCOL.md
-        byte[] configKey = hkdf(sharedSecret, masterKey, "aegs-cfg", 32);
-        byte[] c2sKey    = hkdf(sharedSecret, masterKey, "aegs-c2s", 32);
-        byte[] s2cKey    = hkdf(sharedSecret, masterKey, "aegs-s2c", 32);
-        byte[] maskKey   = hkdf(masterKey, "aegis-v2-salt".getBytes(StandardCharsets.UTF_8), "aegs-v2-header-mask", 32);
+        byte[] configKey  = hkdf(sharedSecret, masterKey, "aegs-cfg", 32);
+        byte[] c2sKey     = hkdf(sharedSecret, masterKey, "aegs-c2s", 32);
+        byte[] s2cKey     = hkdf(sharedSecret, masterKey, "aegs-s2c", 32);
+        byte[] maskKey    = hkdf(masterKey, "aegis-v2-salt".getBytes(StandardCharsets.UTF_8), "aegis-v2-header-mask", 32);
+        byte[] altMaskKey = hkdf(masterKey, "aegis-v2-salt".getBytes(StandardCharsets.UTF_8), "aegs-v2-header-mask", 32);
 
         // Decrypt EncryptedConfig (offset 48, len 16 ciphertext + 16 tag = 32 bytes)
         byte[] encryptedConfigWithTag = new byte[32];
@@ -548,6 +550,7 @@ public final class AegsProtocol {
         res.sendKey = c2sKey;
         res.recvKey = s2cKey;
         res.maskKey = maskKey;
+        res.altMaskKey = altMaskKey;
         res.keyId = keyId;
         return res;
     }
@@ -621,9 +624,13 @@ public final class AegsProtocol {
         System.arraycopy(cipherWithTag, 0, wirePacket, outerHdr.length + 12, cipherWithTag.length);
         return wirePacket;
     }
+    public static byte[] parseDataPacket(byte[] packet, int len, byte[] keyId, byte[] maskKey,
+                                         byte[] recvKey) throws Exception {
+        return parseDataPacket(packet, len, keyId, maskKey, null, recvKey);
+    }
 
     public static byte[] parseDataPacket(byte[] packet, int len, byte[] keyId, byte[] maskKey,
-                                         byte[] recvKey) throws Exception {
+                                         byte[] altMaskKey, byte[] recvKey) throws Exception {
         // Auto-detect and strip RFC 9000 QUIC mimicry (24-byte Long Header)
         if (len >= 24 && (packet[0] & 0x80) != 0 && packet[5] == 0x08 && packet[14] == 0x08 && packet[23] == 0x00) {
             byte[] unwrapped = new byte[len - 24];
@@ -647,15 +654,27 @@ public final class AegsProtocol {
         System.arraycopy(packet, 12, maskedHdr, 0, 16);
 
         byte[] plainHdr = maskUnmaskHeader(maskedHdr, maskKey, hdrIv);
-
-        // Verify KeyID & VER_MAGIC
+        boolean hdrOk = true;
         for (int i = 0; i < 8; i++) {
-            if (plainHdr[i] != keyId[i]) return null;
+            if (plainHdr[i] != keyId[i]) { hdrOk = false; break; }
         }
-        if (plainHdr[12] != VER_MAGIC[0] || plainHdr[13] != VER_MAGIC[1] ||
-                plainHdr[14] != VER_MAGIC[2] || plainHdr[15] != VER_MAGIC[3]) {
-            return null;
+        if (hdrOk && (plainHdr[12] != VER_MAGIC[0] || plainHdr[13] != VER_MAGIC[1] ||
+                plainHdr[14] != VER_MAGIC[2] || plainHdr[15] != VER_MAGIC[3])) {
+            hdrOk = false;
         }
+
+        if (!hdrOk && altMaskKey != null && altMaskKey.length == 32) {
+            plainHdr = maskUnmaskHeader(maskedHdr, altMaskKey, hdrIv);
+            hdrOk = true;
+            for (int i = 0; i < 8; i++) {
+                if (plainHdr[i] != keyId[i]) { hdrOk = false; break; }
+            }
+            if (hdrOk && (plainHdr[12] != VER_MAGIC[0] || plainHdr[13] != VER_MAGIC[1] ||
+                    plainHdr[14] != VER_MAGIC[2] || plainHdr[15] != VER_MAGIC[3])) {
+                hdrOk = false;
+            }
+        }
+        if (!hdrOk) return null;
 
         // Chaff packet drop (anti-timing dummy frames)
         if ((plainHdr[10] & CHAFF_FLAG) != 0) {
