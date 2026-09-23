@@ -26,7 +26,7 @@ struct AegsConfig {
     std::string tun_name      = "aegs0";
     std::string tun4_cidr     = "10.8.0.1/24";
     std::string tun6_prefix   = "fd00:ae95::/64";
-    int         mtu           = 1400;
+    int         mtu           = 1280;
 
     // --- Persistence / auth --------------------------------------------------
     std::string db_path       = "/app/data/aegis.db";
@@ -55,7 +55,7 @@ struct AegsConfig {
         c.traffic_shaping  = gb("AEGS_TRAFFIC_SHAPING",             false);
         c.semantic_padding = gb("AEGS_SEMANTIC_PADDING",             true);
         c.jitter_ms        = gi("AEGS_JITTER_MS",                   5);
-        c.mtu              = gi("AEGS_MTU",                          1400);
+        c.mtu              = gi("AEGS_MTU",                          1280);
         c.worker_threads   = gi("AEGS_WORKERS",                     0);
         c.recv_batch_size  = gi("AEGS_RECV_BATCH_SIZE",             32);
         c.db_path          = gs("AEGS_DB_PATH",                     "/app/data/aegis.db");

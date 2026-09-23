@@ -1,161 +1,103 @@
-# AEGS v6 "Titan" — Ultra High-Speed Stealth Protocol (300-900+ Mbps)
-
-## 📱 [СКАЧАТЬ AEGS ДЛЯ ANDROID (APK)](https://github.com/XDGOOD/net-packet-handler/releases/download/v6.0-titan/AEGS-v6.0-titan.apk)
-> 🚀 **Нативный Android APK (5.18 МБ):** [AEGS-v6.0-titan.apk](https://github.com/XDGOOD/net-packet-handler/releases/download/v6.0-titan/AEGS-v6.0-titan.apk)  
-> Также доступен напрямую в репозитории: [`releases/AEGS-v6.0-titan.apk`](releases/AEGS-v6.0-titan.apk)
-
----
 # AEGS v6 "Titan" — Ultra High-Speed Stealth Protocol 🛡️⚡
 
-[![Tests](https://img.shields.io/badge/Tests-12%2F12%20Pillars%20PASS-brightgreen.svg)](#)
-[![Attacks](https://img.shields.io/badge/Defense%20Audit-12%2F12%20PASS-brightgreen.svg)](#)
 [![Language](https://img.shields.io/badge/Language-C%2B%2B17-blue.svg)](#)
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)](#)
 [![Edition](https://img.shields.io/badge/Edition-v6.0%20Titan-blueviolet.svg)](#)
 [![Status](https://img.shields.io/badge/Status-Release%20Ready-success.svg)](#)
 
-> ⚡ **AEGS v6 Titan Edition** — ультраскоростной (300–900+ Мбит/с), криптографически стойкий и полностью невидимый для DPI туннель. Объединяет симметричные пакетные конвейеры `sendmmsg`/`recvmmsg`, поддержку Jumbo MTU (до 9000 байт), микросекундный AIMD адаптивный пейсинг, двухфазный антиреплей, динамическую мимикрию под RFC 9000/9369 QUIC и отказоустойчивый аппаратный KillSwitch.
+> ⚡ **AEGS v6 Titan Core Edition** — высокоскоростной (300–900+ Мбит/с), криптографически стойкий транспортный протокол с полной защитой от блокировок DPI и ТСПУ. Предназначен для развертывания на персональных серверах, домашних роутерах (OpenWrt) и рабочих станциях.
 > 
-> 🌐 **Нужна распределённая высоконагруженная версия (10+ Гбит/с, sharded data-plane, 10k+ клиентов)?**  
-> Разработка enterprise-архитектуры ведётся в репозитории: **[AEGS Global Edition](https://github.com/XDGOOD/AEGS-Global-)**.
+> 🌐 **Мобильное приложение (Android APK) и распределённый кластер (10+ Гбит/с):**  
+> Официальное мобильное приложение и разработка enterprise multi-node архитектуры ведутся в репозитории: **[AEGS Global Edition (XDGOOD/AEGS-Global-)](https://github.com/XDGOOD/AEGS-Global-)**.
 
 ---
 
-## 🧠 What is AEGS v6 Titan?
-AEGS v6 Titan is an ultra high-speed transport protocol specifically engineered to defeat both **stateful DPI state machines** (ТСПУ, GFW, Cloudflare Magic Firewall) and **AI/ML statistical classifiers** (traffic shape analysis, timing clustering) that easily identify and block WireGuard, OpenVPN, and basic AmneziaWG obfuscations.
+## 🧠 Что такое AEGS v6 Titan?
+
+**AEGS** — это защищённый транспортный протокол нового поколения, спроектированный для преодоления систем глубокой фильтрации пакетов (DPI, ТСПУ, GFW, Cloudflare Magic Firewall) и статистических анализаторов трафика (Anti-ML / AI), которые легко блокируют стандартные протоколы WireGuard, OpenVPN и простые обфускации.
 
 ---
 
-## 🛡 Key Features & Anti-DPI Architecture
+## 🛡 Архитектура и технологии скрытности
 
-### 1. 🧠 State-Machine Pre-Bypass ("AEGS Illusion")
-* **Problem:** Advanced DPI tracks the first 3–5 packets of any new UDP flow. If they don't match a known benign protocol profile, the flow is throttled or dropped.
-* **Solution:** Before transmitting `HANDSHAKE_INIT`, client transmits 1–3 decoy packets that precisely mimic **RFC 5389 STUN Binding Requests** (`0x2112A442` magic cookie) or **RFC 9000 QUIC Initial packets** (≥1200 bytes).
-* **Effect:** The ISP's DPI classifies the connection as benign WebRTC/STUN or HTTP/3 traffic and stops deep packet inspection.
+### 1. 🧠 State-Machine Pre-Bypass («AEGS Illusion»)
+Перед отправкой `HANDSHAKE_INIT` клиент передает 1–3 decoy-пакета, точно имитирующих **RFC 5389 STUN Binding Requests** или **RFC 9000 QUIC Initial** (≥1200 байт). DPI классифицирует соединение как доверенный WebRTC/STUN или HTTP/3 трафик и отключает углубленный анализ потока.
 
-### 2. 🎭 Semantic Padding ("Bimodal Shaping" — Anti-ML)
-* **Problem:** Neural networks detect VPN tunnels by uniform packet-size distributions (e.g. random 0–256 bytes in AmneziaWG).
-* **Solution:** Intelligently shapes traffic into a bimodal profile mimicking YouTube/QUIC streaming:
-  * Small packets (≤200 B: ACKs, DNS, TCP SYN) are padded to **~256 B** (QUIC ACK profile).
-  * Large packets (>200 B: video, web assets) are padded to **~1350 B** (Full MTU QUIC frames).
-  * 5% random medium packets (512–768 B) inject noise to prevent exact-size fingerprinting.
+### 2. 🎭 Семантический паддинг («Bimodal Shaping» — Anti-ML)
+Вместо равномерного случайного шума протокол формирует бимодальный профиль реального видеостриминга:
+* Малые пакеты (≤200 B: ACK, DNS, TCP SYN) дополняются до **~256 B** (профиль QUIC ACK).
+* Большие пакеты (>200 B) дополняются до **~1350 B** (полный MTU QUIC).
+* 5% случайного шума (512–768 B) для защиты от фингерпринтинга распределения.
 
-### 3. 👻 Active Chaffing (Anti-Timing Analysis)
-* **Problem:** VPN usage is easily fingerprinted by bursty idle/active timing patterns.
-* **Solution:** When idle for >500 ms, client generates encrypted dummy chaff packets at 50–200 ms intervals. PlainHDR byte 10 has bit `0x80` set. The server verifies AEAD MAC, detects the chaff flag, and silently drops the packet without forwarding to the OS network stack.
-* **Effect:** The tunnel appears as a continuous, active WebRTC voice/video call.
+### 3. 👻 Active Chaffing (Защита от тайминг-анализа)
+При простое канала (>500 мс) клиент генерирует зашифрованные фиктивные chaff-пакеты (флаг `0x80`). Сервер проверяет криптографическую подпись Poly1305 и бесшумно отбрасывает их. Для провайдера туннель выглядит как непрерывный видеозвонок или голосовая сессия.
 
-### 4. 🛡 Cryptographic Blackhole (Anti-Active Probing)
-* **Problem:** Scanners send malformed probes to detect VPN server behavior.
-* **Solution:** Rather than dropping or sending DNS FORMERR, the server derives entropy from the probe and responds with authentic QUIC packets:
-  * **60%**: QUIC Version Negotiation (RFC 9000 §17.2.1, echoes prober's CIDs)
-  * **20%**: QUIC Retry token packet
-  * **20%**: QUIC Connection Close (`PROTOCOL_VIOLATION`)
-* **Effect:** Scanners conclude the port hosts an ordinary QUIC server and de-list the IP.
+### 4. 🛡 Cryptographic Blackhole (Защита от активного сканирования)
+При получении некорректных зондов от сетевых сканеров сервер отвечает аутентичными QUIC-пакетами (Version Negotiation, Retry, Connection Close) с нулевым коэффициентом усиления (0.0x amplification на мелкие зонды).
 
-### 5. 🔀 Port Hopping (Active DPI Evasion)
-* **Problem:** DPI blocks specific UDP ports when VPN traffic is suspected.
-* **Solution:** Server binds to multiple ports. Client uses HMAC-SHA256 to deterministically hop ports every `hop_interval` seconds based on the session key.
+### 5. 🔀 Port Hopping
+Периодическая смена UDP-портов по алгоритму HMAC-SHA256 на основе сессионного ключа для обхода точечной блокировки портов.
 
-### 6. ⚡ Session Resumption (Zero-RTT Reconnect)
-* **Problem:** ECDH handshakes are expensive and slow down reconnections.
-* **Solution:** Server issues an encrypted, AEAD-authenticated 96-byte `ResumptionToken`. Client sends a `RESUME` packet to reconnect in <5ms.
+### 6. ⚡ Zero-RTT Session Resumption
+Мгновенное возобновление сессии (<5 мс) по зашифрованному 96-байтному `ResumptionToken` без повторного тяжелого вычисления Curve25519 ECDH.
 
-### 7. 🔒 Hardware Kill-Switch & DNS Leak Shield
-* **Problem:** If a tunnel unexpectedly disconnects, packets leak to the ISP via physical adapters. Plaintext DNS queries (port 53) leak visited domains.
-* **Solution:** Hardware/firewall-level isolation (`--kill-switch`) drops all external traffic except direct packets to the VPN server, while `--dns-protect` enforces tunnel DNS and blocks port 53 leakage.
+### 7. 🔒 Fail-Closed Kill-Switch & DNS Leak Shield
+Аппаратная изоляция через выделенные цепочки сетевого фильтра (iptables / WinFilter) с блокировкой открытого 53 порта и принудительным туннельным DNS (`10.8.0.1`).
 
 ---
 
-## 📡 Protocol Wire Specification
-* **HANDSHAKE_INIT** (72 bytes): `type(1)` + `reserved(7)` + `key_id(8)` + `ephemeral_pk(32)` + `timestamp_ms(8)` + `mac(16, HMAC-SHA256(MasterKey))`
-* **HANDSHAKE_RESP** (80 bytes): `type(1)` + `reserved(7)` + `session_id(8)` + `server_epk(32)` + `encrypted_config(16)` + `aead_tag(16, Poly1305)`
+## 📡 Спецификация пакетов на проводе
+
+* **HANDSHAKE_INIT** (72 байта): `type(1)` + `reserved(7)` + `key_id(8)` + `ephemeral_pk(32)` + `timestamp_ms(8)` + `mac(16, HMAC-SHA256(MasterKey))`
+* **HANDSHAKE_RESP** (80 байт): `type(1)` + `reserved(7)` + `session_id(8)` + `server_epk(32)` + `encrypted_config(16)` + `aead_tag(16, Poly1305)`
 * **DATA packet**: `hdr_iv(12)` + `masked_hdr(16, ChaCha20)` + `[junk/chaff]` + `aead_nonce(12)` + `ChaCha20-Poly1305(frame)`
-* **Frame**: `plen(2)` + `ip_packet(plen)` + `bimodal_padding` (target ~256B / ~1350B)
+* **Frame**: `plen(2)` + `ip_packet(plen)` + `bimodal_padding` (целевые ~256B / ~1350B)
 
 ---
 
-## 📊 Comparison Table: AEGS v6 Titan vs Competitors
+## 📊 Сравнительная таблица
 
-| Feature | WireGuard | AmneziaWG 3.1 | XTLS-Reality | **AEGS v6 Titan** |
+| Функция | WireGuard | AmneziaWG | XTLS-Reality | **AEGS v6 Titan** |
 |---|---|---|---|---|
-| Static DPI signature | ❌ Static | ⚠️ Masked header | N/A (TCP only) | ✅ **Zero signatures (masked + random IV)** |
-| DPI State-Machine Bypass | ❌ None | ⚠️ Random junk (`Jc`) | ⚠️ TLS ClientHello | ✅ **Illusion (RFC 5389 STUN + RFC 9000 QUIC)** |
-| Protocol Mimicry | ❌ None | ❌ None | ⚠️ TLS Mimicry | ✅ **End-to-End QUIC Initial Evasion (RFC 9000/9369)** |
-| Anti-ML Padding | ❌ None | ⚠️ Uniform random | ❌ None | ✅ **Bimodal Semantic Shaping (~256B / ~1350B)** |
-| Anti-Timing Obfuscation | ❌ None | ❌ None | ❌ None | ✅ **Active Chaffing (PlainHDR bit 0x80)** |
-| Active Prober Defense | ❌ None | ⚠️ DNS FORMERR | ✅ TLS Camouflage | ✅ **Cryptographic Blackhole (<3x Amplification)** |
-| Transport Protocol | UDP | UDP | TCP only | ✅ **UDP + Port Hopping + Mimicry** |
-| Forward Secrecy (PFS) | ✅ Noise IK | ✅ Noise IK | ✅ TLS 1.3 | ✅ **X25519 ECDH per-session & 0-RTT/1-RTT Resume** |
-| Hardware Kill-Switch | ⚠️ Client app | ⚠️ Client app | ⚠️ Client app | ✅ **Fail-Closed Firewall Isolation + Port 53 Shield** |
-| Anti-Replay Protection | ⚠️ Single-phase | ⚠️ Single-phase | ✅ TLS Record | ✅ **Two-Phase Commit (Verify-Before-Commit)** |
-| Throughput & Batch Pipeline | ⚠️ Standard | ⚠️ Standard | ⚠️ Standard | ✅ **300–900+ Mbps (`sendmmsg`/`recvmmsg` zero-copy)** |
-| Jumbo MTU & Pacing | ❌ 1420B max | ❌ 1420B max | ❌ Standard | ✅ **Up to 9000B Jumbo MTU + AIMD Pacing** |
+| Сигнатура заголовка на проводе | ❌ Статическая | ⚠️ Маскированная | N/A (TCP) | ✅ **Zero signatures (рандомный IV + маска)** |
+| Обход DPI State-Machine | ❌ Нет | ⚠️ Случайный мусор | ⚠️ TLS ClientHello | ✅ **Illusion (RFC 5389 STUN + RFC 9000 QUIC)** |
+| Мимикрия протокола | ❌ Нет | ❌ Нет | ⚠️ TLS | ✅ **RFC 9000/9369 QUIC Initial Evasion** |
+| Защита от нейросетей (Pad) | ❌ Нет | ⚠️ Равномерный | ❌ Нет | ✅ **Бимодальный шейпинг (~256B / ~1350B)** |
+| Защита от тайминг-анализа | ❌ Нет | ❌ Нет | ❌ Нет | ✅ **Active Chaffing (флаг 0x80)** |
+| Защита от активных сканеров | ❌ Нет | ⚠️ DNS FORMERR | ✅ TLS Camouflage | ✅ **Cryptographic Blackhole (0.0x amp)** |
+| Perfect Forward Secrecy (PFS) | ✅ Noise IK | ✅ Noise IK | ✅ TLS 1.3 | ✅ **X25519 ECDH на каждую сессию + 0-RTT** |
+| Пакетный конвейер | ⚠️ Стандартный | ⚠️ Стандартный | ⚠️ Стандартный | ✅ **Zero-Copy `sendmmsg`/`recvmmsg` (до 900+ Мбит/с)** |
+| Jumbo MTU | ❌ До 1420B | ❌ До 1420B | ❌ Стандартный | ✅ **До 9000B Jumbo MTU + AIMD Pacing** |
 
 ---
 
-## 🧪 12-Pillar Test Suite
+## 🚀 Быстрый запуск
 
-The project includes a comprehensive 12-Pillar verification suite:
-* **Pillar 1:** Cryptographic Context Separation (HKDF-SHA256, 200k PBKDF2 iterations)
-* **Pillar 2:** Shannon Entropy (>7.2 / 8.0 on wire, indistinguishable from white noise)
-* **Pillar 3:** RFC 6479 64-bit Anti-Replay Sliding Window & 100% Poly1305 tamper detection
-* **Pillar 4:** Active DPI Probing & Malformed Scan Resistance (5,000 scans)
-* **Pillar 5:** Zero-Allocation Throughput & Processing Benchmark
-* **Pillar 6:** Semantic Bimodal Padding & Size Distribution (~256B & ~1350B)
-* **Pillar 7:** State-Machine Pre-Bypass (RFC 5389 STUN & RFC 9000 QUIC Initial format)
-* **Pillar 8:** Active Chaffing, Idle Detection & Server Silent Drop
-* **Pillar 9:** Cryptographic Blackhole Adaptive Probing Deception (Token-bucket rate limiter + 3 strategies)
-* **Pillar 10:** Deterministic HMAC-SHA256 Port Hopping with Uniform Port Distribution
-* **Pillar 11:** ChaCha20-Poly1305 Encrypted 96-Byte Session Resumption Tokens (<5ms 0-RTT)
-* **Pillar 12:** Hardware Kill-Switch Isolation, Port 53 DNS Shield & Transport Blackout Detection
-
-Run the suite:
-```bash
-python test_suite_v4.py
-# or C++ native test runner:
-./build/aegis_test
-
-# Or compile and run with AddressSanitizer & UndefinedBehaviorSanitizer:
-cmake -B build -DENABLE_ASAN=ON && cmake --build build
-./build/aegis_test
-```
-
----
-
-## 🚀 Quick Start
-
-### Server (Linux)
+### Сервер (Linux)
 ```bash
 git clone https://github.com/XDGOOD/net-packet-handler
 cd net-packet-handler
-./scripts/manage.sh install    # Builds, installs, starts systemd service
-./scripts/manage.sh add-user alice  # Creates user, prints client token
+./manage.sh install        # Сборка, настройка сети и запуск службы systemd
+./manage.sh add-user alice # Добавление пользователя и вывод токена
 ```
 
-### Client
-* **Linux / macOS:**
+### Клиенты
+
+* **Windows:** Запустите `tools/AEGS.bat` или графический интерфейс `tools/aegs_app.py`.
+* **Домашний роутер (OpenWrt):** Выполните `scripts/aegs_openwrt.sh`.
+* **Linux / macOS (CLI):**
   ```bash
-  ./aegis_client <SERVER_IP> 50001 <YOUR_TOKEN>
+  ./build/aegis_client <IP_СЕРВЕРА> 50001 <ВАШ_ТОКЕН>
   ```
-* **Windows (Native Python Runner):**
-  ```bash
-  python scripts/quick_client.py run -s <SERVER_IP> -t <YOUR_TOKEN>
-  ```
-* **Docker Deployment:**
-  ```bash
-  docker compose up -d
-  ```
+* **Мобильный клиент Android:**  
+  Доступен в официальном репозитории **[XDGOOD/AEGS-Global-](https://github.com/XDGOOD/AEGS-Global-)**.
 
 ---
 
-## 📁 Project Structure
-* `client.cpp` — Native client implementation with Illusion Pre-Bypass, ChaffEngine, and Semantic Padding.
-* `server.cpp` — Epoll server listener, BlackholeResponder, NAT manager, and session table.
-* `illusion_prebypass.h/cpp` — State-Machine Pre-Bypass (STUN RFC 5389 & QUIC Initial RFC 9000 decoys).
-* `traffic_shaper.h/cpp` — Semantic padding (bimodal distribution) and microsecond send jitter.
-* `chaff_engine.h/cpp` — Active chaffing generation and idle timing engine.
-* `blackhole_responder.h/cpp` — Cryptographic blackhole response generator for probe deterrence.
-* `test_runner.cpp` — Native C++ 11-Pillar test suite.
-* `test_suite_v4.py` — Standalone Python 11-Pillar verification runner.
-* `scripts/quick_client.py` — Cross-platform client supervisor and WireGuard proxy.
+## 🧪 Тестирование и верификация
+
+Запуск полного тестового набора безопасности и устойчивости к атакам:
+```bash
+python tests/test_suite_v4.py
+python tests/run_attack_tests.py
+```

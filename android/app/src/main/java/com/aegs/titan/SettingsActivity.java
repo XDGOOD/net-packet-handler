@@ -1,0 +1,301 @@
+package com.aegs.titan;
+
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.net.Uri;
+import android.os.Bundle;
+import android.view.View;
+import android.widget.ImageView;
+import android.widget.RadioGroup;
+import android.widget.Toast;
+
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.appcompat.app.AppCompatDelegate;
+import androidx.appcompat.widget.SwitchCompat;
+import androidx.appcompat.app.AlertDialog;
+import android.content.pm.PackageManager;
+import android.content.pm.ApplicationInfo;
+import android.widget.EditText;
+import android.widget.TextView;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+public class SettingsActivity extends AppCompatActivity {
+    public static final String PREFS_NAME = "aegs_prefs";
+    public static final String KEY_PROTOCOL_MODE = "protocol_mode";
+    public static final String KEY_ADAPTIVE_CHAFF = "adaptive_chaff";
+    public static final String KEY_SPLIT_TUNNEL = "split_tunnel";
+    public static final String KEY_KILL_SWITCH = "kill_switch";
+    public static final String KEY_DYNAMIC_THEME = "dynamic_theme";
+    public static final String KEY_CUSTOM_BYPASS_DOMAINS = "custom_bypass_domains";
+
+    public static final int PROTO_EMERGENCY = 0;       // Аварийное (при блокировках • Reality ECH)
+    public static final int PROTO_FAST_EMERGENCY = 1;  // Быстрый аварийный (0-RTT + IAT Shaper)
+    public static final int PROTO_TURBO_PQC = 2;       // Скоростной и Защищенный (Turbo UDP + Kyber-768)
+    public static final int PROTO_HYBRID_AUTO = 3;     // Универсальный (Все варианты • Адаптивный авто-выбор)
+
+    public static final int PROTO_REALITY_ECH = PROTO_EMERGENCY;
+    public static final int PROTO_STEALTH = PROTO_FAST_EMERGENCY;
+    public static final int PROTO_FAST_RESUME = PROTO_FAST_EMERGENCY;
+    public static final int PROTO_ILLUSION = PROTO_EMERGENCY;
+    public static final int PROTO_TCP_FALLBACK = PROTO_EMERGENCY;
+
+    private RadioGroup mRgProtocol;
+    private SwitchCompat mSwKillSwitch;
+    private SwitchCompat mSwDynamicTheme;
+    private SwitchCompat mSwAdaptiveChaff;
+    private SwitchCompat mSwSplitTunnel;
+    private SharedPreferences mPrefs;
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        updateBypassCountLabel();
+    }
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_settings);
+
+        mPrefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+
+        ImageView btnBack = findViewById(R.id.btn_back);
+        btnBack.setOnClickListener(v -> finish());
+
+        mRgProtocol = findViewById(R.id.rg_protocol);
+        mSwKillSwitch = findViewById(R.id.sw_killswitch);
+        mSwDynamicTheme = findViewById(R.id.sw_dynamic_theme);
+        mSwAdaptiveChaff = findViewById(R.id.sw_adaptive_chaff);
+        mSwSplitTunnel = findViewById(R.id.sw_split_tunnel);
+
+        // Load saved preferences
+        int savedProto = mPrefs.getInt(KEY_PROTOCOL_MODE, PROTO_EMERGENCY);
+        switch (savedProto) {
+            case PROTO_FAST_EMERGENCY:
+                mRgProtocol.check(R.id.rb_proto_fast_emergency);
+                break;
+            case PROTO_TURBO_PQC:
+                mRgProtocol.check(R.id.rb_proto_turbo_pqc);
+                break;
+            case PROTO_HYBRID_AUTO:
+                mRgProtocol.check(R.id.rb_proto_hybrid_auto);
+                break;
+            case PROTO_EMERGENCY:
+            default:
+                mRgProtocol.check(R.id.rb_proto_emergency);
+                break;
+        }
+
+        mSwKillSwitch.setChecked(mPrefs.getBoolean(KEY_KILL_SWITCH, true));
+        mSwDynamicTheme.setChecked(mPrefs.getBoolean(KEY_DYNAMIC_THEME, true));
+        mSwAdaptiveChaff.setChecked(mPrefs.getBoolean(KEY_ADAPTIVE_CHAFF, true));
+        mSwSplitTunnel.setChecked(mPrefs.getBoolean(KEY_SPLIT_TUNNEL, true));
+
+        // Save listeners
+        mRgProtocol.setOnCheckedChangeListener((group, checkedId) -> {
+            int mode = PROTO_EMERGENCY;
+            if (checkedId == R.id.rb_proto_fast_emergency) {
+                mode = PROTO_FAST_EMERGENCY;
+            } else if (checkedId == R.id.rb_proto_turbo_pqc) {
+                mode = PROTO_TURBO_PQC;
+            } else if (checkedId == R.id.rb_proto_hybrid_auto) {
+                mode = PROTO_HYBRID_AUTO;
+            }
+            mPrefs.edit().putInt(KEY_PROTOCOL_MODE, mode).apply();
+            Toast.makeText(this, "Режим подключения сохранен", Toast.LENGTH_SHORT).show();
+        });
+
+        mSwKillSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            mPrefs.edit().putBoolean(KEY_KILL_SWITCH, isChecked).apply();
+            Toast.makeText(this, isChecked ? "Kill-Switch активирован" : "Kill-Switch отключен", Toast.LENGTH_SHORT).show();
+        });
+
+        mSwDynamicTheme.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            mPrefs.edit().putBoolean(KEY_DYNAMIC_THEME, isChecked).apply();
+            if (isChecked) {
+                AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM);
+            } else {
+                AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES);
+            }
+        });
+
+        mSwAdaptiveChaff.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            mPrefs.edit().putBoolean(KEY_ADAPTIVE_CHAFF, isChecked).apply();
+        });
+
+        mSwSplitTunnel.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            mPrefs.edit().putBoolean(KEY_SPLIT_TUNNEL, isChecked).apply();
+        });
+
+        // Author and GitHub links
+        View btnAuthor = findViewById(R.id.btn_link_author);
+        if (btnAuthor != null) {
+            btnAuthor.setOnClickListener(v -> openUrl("https://github.com/XDGOOD"));
+        }
+
+        View btnCore = findViewById(R.id.btn_link_core);
+        if (btnCore != null) {
+            btnCore.setOnClickListener(v -> openUrl("https://github.com/XDGOOD/net-packet-handler"));
+        }
+
+        View btnGlobal = findViewById(R.id.btn_link_global);
+        if (btnGlobal != null) {
+            btnGlobal.setOnClickListener(v -> openUrl("https://github.com/XDGOOD/AEGS-Global-"));
+        }
+
+        View btnLicense = findViewById(R.id.btn_link_license);
+        if (btnLicense != null) {
+            btnLicense.setOnClickListener(v -> showLicenseDialog());
+        }
+
+        View btnChooseBypass = findViewById(R.id.btn_choose_bypass_apps);
+        if (btnChooseBypass != null) {
+            btnChooseBypass.setOnClickListener(v -> {
+                Intent intent = new Intent(this, AppRoutingActivity.class);
+                startActivity(intent);
+            });
+        }
+
+        View btnChooseDomains = findViewById(R.id.btn_choose_bypass_domains);
+        if (btnChooseDomains != null) {
+            btnChooseDomains.setOnClickListener(v -> showDomainSelectionDialog());
+        }
+        updateBypassCountLabel();
+        updateBypassDomainsLabel();
+    }
+
+    private void openUrl(String url) {
+        try {
+            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+            startActivity(intent);
+        } catch (Exception e) {
+            Toast.makeText(this, "Не удалось открыть ссылку: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void updateBypassCountLabel() {
+        TextView tv = findViewById(R.id.tv_bypass_apps_count);
+        if (tv == null) return;
+        Set<String> custom = mPrefs.getStringSet("custom_bypass_packages", null);
+        int count = custom != null ? custom.size() : 9;
+        tv.setText("Маршрутизация приложений (" + count + " напрямую)");
+    }
+
+    private void updateBypassDomainsLabel() {
+        TextView tv = findViewById(R.id.tv_bypass_domains_count);
+        if (tv == null) return;
+        Set<String> custom = mPrefs.getStringSet(KEY_CUSTOM_BYPASS_DOMAINS, null);
+        int count = custom != null ? custom.size() : DEFAULT_DOMAINS.length;
+        tv.setText("Сайты и домены в обход VPN (" + count + " настроено)");
+    }
+
+    private static final String[] DEFAULT_DOMAINS = {
+            "gosuslugi.ru", "sberbank.ru", "tbank.ru", "vtb.ru",
+            "ya.ru", "yandex.ru", "kinopoisk.ru", "ozon.ru", "wildberries.ru"
+    };
+
+    private void showDomainSelectionDialog() {
+        Set<String> savedDomains = mPrefs.getStringSet(KEY_CUSTOM_BYPASS_DOMAINS, null);
+        final List<String> domainList = new ArrayList<>();
+        if (savedDomains != null) {
+            domainList.addAll(savedDomains);
+        } else {
+            domainList.addAll(Arrays.asList(DEFAULT_DOMAINS));
+        }
+
+        final boolean[] checked = new boolean[domainList.size()];
+        Arrays.fill(checked, true);
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Сайты и домены в обход VPN");
+
+        builder.setMultiChoiceItems(domainList.toArray(new CharSequence[0]), checked, (dialog, which, isChecked) -> {
+            checked[which] = isChecked;
+        });
+
+        final EditText etNewDomain = new EditText(this);
+        etNewDomain.setHint("Добавить домен (например, vk.com)");
+        builder.setView(etNewDomain);
+
+        builder.setPositiveButton("Сохранить", (dialog, which) -> {
+            Set<String> resultSet = new HashSet<>();
+            for (int i = 0; i < domainList.size(); i++) {
+                if (checked[i]) resultSet.add(domainList.get(i));
+            }
+            String newDom = etNewDomain.getText().toString().trim().toLowerCase();
+            if (!newDom.isEmpty() && newDom.contains(".")) {
+                resultSet.add(newDom);
+            }
+            mPrefs.edit().putStringSet(KEY_CUSTOM_BYPASS_DOMAINS, resultSet).apply();
+            updateBypassDomainsLabel();
+            Toast.makeText(this, "Сохранено доменов в обход: " + resultSet.size(), Toast.LENGTH_SHORT).show();
+        });
+
+        builder.setNegativeButton("Отмена", null);
+        builder.show();
+    }
+
+    private void showLicenseDialog() {
+        new androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("AEGS Non-Commercial Community License v1.0")
+                .setMessage("Правообладатель и автор протокола: XDGOOD\n\n" +
+                        "Протокол AEGS и мобильный клиент распространяются исключительно для некоммерческого, исследовательского и личного использования.\n\n" +
+                        "Любое коммерческое использование, перепродажа, продажа платных VPN-подписок и интеграция в коммерческие маршрутизаторы без прямого предварительного письменного согласия автора (XDGOOD) СТРОГО ЗАПРЕЩЕНЫ.\n\n" +
+                        "Все права защищены.")
+                .setPositiveButton("Понятно", null)
+                .show();
+    }
+
+    private void showAppSelectionDialog() {
+        new Thread(() -> {
+            PackageManager pm = getPackageManager();
+            java.util.List<android.content.pm.ApplicationInfo> installed = pm.getInstalledApplications(PackageManager.GET_META_DATA);
+            java.util.List<String> names = new java.util.ArrayList<>();
+            java.util.List<String> pkgs = new java.util.ArrayList<>();
+
+            for (android.content.pm.ApplicationInfo ai : installed) {
+                if ((ai.flags & android.content.pm.ApplicationInfo.FLAG_SYSTEM) == 0 || pm.getLaunchIntentForPackage(ai.packageName) != null) {
+                    names.add(pm.getApplicationLabel(ai).toString() + " (" + ai.packageName + ")");
+                    pkgs.add(ai.packageName);
+                }
+            }
+
+            java.util.Set<String> saved = mPrefs.getStringSet("custom_bypass_packages", null);
+            if (saved == null) {
+                saved = new java.util.HashSet<>(java.util.Arrays.asList(
+                        "ru.sberbankmobile", "com.idamob.tinkoff.android", "ru.vtb24.mobilebanking",
+                        "ru.alfabank.mobile.android", "ru.gosuslugi.net", "ru.yandex.searchplugin",
+                        "com.vkontakte.android", "ru.ozon.app.android", "com.wildberries.ru"
+                ));
+            }
+
+            final boolean[] checked = new boolean[pkgs.size()];
+            for (int i = 0; i < pkgs.size(); i++) {
+                checked[i] = saved.contains(pkgs.get(i));
+            }
+
+            runOnUiThread(() -> {
+                new androidx.appcompat.app.AlertDialog.Builder(this)
+                        .setTitle("Приложения в обход VPN")
+                        .setMultiChoiceItems(names.toArray(new CharSequence[0]), checked, (dialog, which, isChecked) -> {
+                            checked[which] = isChecked;
+                        })
+                        .setPositiveButton("Сохранить", (dialog, which) -> {
+                            java.util.Set<String> newSet = new java.util.HashSet<>();
+                            for (int i = 0; i < pkgs.size(); i++) {
+                                if (checked[i]) newSet.add(pkgs.get(i));
+                            }
+                            mPrefs.edit().putStringSet("custom_bypass_packages", newSet).apply();
+                            updateBypassCountLabel();
+                            Toast.makeText(this, "Сохранено приложений в обход: " + newSet.size(), Toast.LENGTH_SHORT).show();
+                        })
+                        .setNegativeButton("Отмена", null)
+                        .show();
+            });
+        }).start();
+    }
+}
