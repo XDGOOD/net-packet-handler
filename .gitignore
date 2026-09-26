@@ -33,3 +33,4 @@ test_run_*/
 # Tools & Private Bots
 tools/
 tools/telegram_bot/
+scratch/
