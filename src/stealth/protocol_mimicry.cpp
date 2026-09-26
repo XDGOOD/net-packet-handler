@@ -33,8 +33,8 @@ size_t ProtocolMimicry::wrap_quic_initial(uint8_t*       buf,
                                           size_t         buf_capacity,
                                           const uint8_t  session_seed[2],
                                           uint32_t       quic_version) noexcept {
-    // Ensure there is room for the header
-    if (data_len + kQuicHeaderSize > buf_capacity)
+    // Ensure there is room for the header and validate input bounds to prevent Buffer Overflow
+    if (!buf || buf_capacity < kQuicHeaderSize || data_len + kQuicHeaderSize > buf_capacity)
         return data_len; // Cannot prepend — return unchanged length as a safe fallback
 
     uint8_t rand_bytes[18];
@@ -108,6 +108,9 @@ size_t ProtocolMimicry::wrap(uint8_t*       buf,
                              size_t         buf_capacity,
                              const uint8_t  session_seed[2]) noexcept {
     if (mode_ == Mode::NONE)
+        return data_len;
+
+    if (!buf || buf_capacity < header_size_ || data_len + header_size_ > buf_capacity)
         return data_len;
 
     uint32_t v = quic_version_;

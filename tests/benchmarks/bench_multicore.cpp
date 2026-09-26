@@ -14,8 +14,8 @@
 #include <numeric>
 #include <cassert>
 #include <cstring>
-#include "../session_table.h"
-#include "../crypto_utils.h"
+#include "session_table.h"
+#include "crypto_utils.h"
 
 struct LatencyCollector {
     std::vector<uint32_t> samples_ns;

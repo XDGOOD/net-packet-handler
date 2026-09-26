@@ -19,10 +19,10 @@
 #include <random>
 #include <chrono>
 
-#include "../session_resumption.h"
-#include "../network_security.h"
-#include "../crypto_utils.h"
-#include "../blackhole_responder.h"
+#include "session_resumption.h"
+#include "network_security.h"
+#include "crypto_utils.h"
+#include "blackhole_responder.h"
 
 // -----------------------------------------------------------------------------
 // 1. Fuzz Handshake INIT parser

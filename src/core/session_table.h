@@ -16,6 +16,7 @@
 #include <array>
 #include <memory>
 #include <cstring>
+#include <openssl/rand.h>
 #include "session.h"
 
 class SessionTable {
@@ -214,7 +215,22 @@ public:
     }
 
 private:
+    static inline uint64_t get_shard_seed() noexcept {
+        static const uint64_t s_seed = []() {
+            uint64_t r = 0;
+            uint8_t rand_buf[8];
+            if (RAND_bytes(rand_buf, 8) == 1) {
+                std::memcpy(&r, rand_buf, 8);
+            } else {
+                r = 0x9e3779b97f4a7c15ULL;
+            }
+            return r;
+        }();
+        return s_seed;
+    }
+
     static size_t shard_idx(uint64_t k) noexcept {
+        k ^= get_shard_seed();
         k ^= k >> 30;
         k *= 0xbf58476d1ce4e5b9ULL;
         k ^= k >> 27;
@@ -223,12 +239,12 @@ private:
         return static_cast<size_t>(k % NUM_SHARDS);
     }
 
-    struct KeyShard {
+    struct alignas(64) KeyShard {
         mutable std::shared_mutex mu;
         std::unordered_map<uint64_t, Session*> by_key_id;
     };
 
-    struct EndpointShard {
+    struct alignas(64) EndpointShard {
         mutable std::shared_mutex mu;
         std::unordered_map<uint64_t, Session*> by_endpoint;
     };

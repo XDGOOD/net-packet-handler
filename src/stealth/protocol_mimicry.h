@@ -47,50 +47,105 @@ public:
     static constexpr size_t kQuicHeaderSize = 24;
 
     // Checks whether an incoming buffer contains a valid RFC 9000 QUIC mimicry header
+    // Supports dynamic CID lengths (4..20 bytes) to prevent fingerprinting
     static inline bool is_quic_mimicry(const uint8_t* buf, size_t len) noexcept {
-        if (!buf || len < kQuicHeaderSize) return false;
+        if (!buf || len < 12) return false;
         uint8_t b0 = buf[0];
         if ((b0 & 0x80) == 0) return false; // Must be Long Header
-        if (buf[5] != 0x08 || buf[14] != 0x08 || buf[23] != 0x00) return false;
 
         uint32_t version = (static_cast<uint32_t>(buf[1]) << 24) |
                            (static_cast<uint32_t>(buf[2]) << 16) |
                            (static_cast<uint32_t>(buf[3]) << 8)  |
                             static_cast<uint32_t>(buf[4]);
 
-        return (version == kQuicVersion1 || version == kQuicVersion2 ||
-                version == kQuicDraft29  || version == kQuicDraft32  ||
-                version == kQuicVerNeg);
+        bool valid_version = (version == kQuicVersion1 || version == kQuicVersion2 ||
+                              version == kQuicDraft29  || version == kQuicDraft32  ||
+                              version == kQuicVerNeg);
+        if (!valid_version) return false;
+
+        uint8_t dcid_len = buf[5];
+        if (dcid_len > 20) return false;
+        size_t scid_offset = 6 + dcid_len;
+        if (scid_offset >= len) return false;
+
+        uint8_t scid_len = buf[scid_offset];
+        if (scid_len > 20) return false;
+
+        size_t token_offset = scid_offset + 1 + scid_len;
+        if (token_offset > len) return false;
+
+        return true;
     }
 
-    // In-place zero-copy unwrap: advances pointer past QUIC header and reduces len
+    // In-place zero-copy unwrap: advances pointer past dynamic RFC 9000 QUIC header and reduces len
     static inline bool strip_quic_mimicry(const uint8_t*& buf, size_t& len) noexcept {
-        if (is_quic_mimicry(buf, len)) {
-            buf += kQuicHeaderSize;
-            len -= kQuicHeaderSize;
-            return true;
+        if (!buf || len < 12) return false;
+        uint8_t b0 = buf[0];
+        if ((b0 & 0x80) == 0) return false; // Long Header
+
+        uint32_t version = (static_cast<uint32_t>(buf[1]) << 24) |
+                           (static_cast<uint32_t>(buf[2]) << 16) |
+                           (static_cast<uint32_t>(buf[3]) << 8)  |
+                            static_cast<uint32_t>(buf[4]);
+
+        bool valid_version = (version == kQuicVersion1 || version == kQuicVersion2 ||
+                              version == kQuicDraft29  || version == kQuicDraft32  ||
+                              version == kQuicVerNeg);
+        if (!valid_version) return false;
+
+        uint8_t dcid_len = buf[5];
+        if (dcid_len > 20) return false;
+        size_t scid_offset = 6 + dcid_len;
+        if (scid_offset >= len) return false;
+
+        uint8_t scid_len = buf[scid_offset];
+        if (scid_len > 20) return false;
+
+        size_t token_offset = scid_offset + 1 + scid_len;
+        if (token_offset > len) return false;
+
+        size_t hdr_len = token_offset;
+        if (version != kQuicVerNeg) {
+            if (token_offset >= len) return false;
+            uint8_t t0 = buf[token_offset];
+            size_t token_val_len = 0;
+            size_t varint_len = 1;
+            if ((t0 & 0xC0) == 0x00) {
+                token_val_len = t0;
+                varint_len = 1;
+            } else if ((t0 & 0xC0) == 0x40) {
+                if (token_offset + 2 > len) return false;
+                token_val_len = ((t0 & 0x3F) << 8) | buf[token_offset + 1];
+                varint_len = 2;
+            }
+            hdr_len = token_offset + varint_len + token_val_len;
         }
-        return false;
+
+        if (hdr_len >= len) return false;
+        buf += hdr_len;
+        len -= hdr_len;
+        return true;
     }
 
     static inline bool strip_quic_mimicry(uint8_t*& buf, size_t& len) noexcept {
-        if (is_quic_mimicry(buf, len)) {
-            buf += kQuicHeaderSize;
-            len -= kQuicHeaderSize;
+        const uint8_t* cbuf = buf;
+        if (strip_quic_mimicry(cbuf, len)) {
+            buf = const_cast<uint8_t*>(cbuf);
             return true;
         }
         return false;
     }
 
     // Checks whether an incoming buffer contains a TLS 1.3 Reality ECH wrapper
+    // Zero static strings (eliminating "AEG1" DPI pattern-matching vector)
     static inline bool is_tls_reality_mimicry(const uint8_t* buf, size_t len) noexcept {
         if (!buf || len < 45 || buf[0] != 0x16) return false;
         for (size_t i = 5; i + 10 <= len; ++i) {
             if (buf[i] == 0xFE && buf[i + 1] == 0x0D) {
                 size_t ext_len = (static_cast<size_t>(buf[i + 2]) << 8) | buf[i + 3];
-                size_t ext_end = (i + 4 + ext_len < len) ? (i + 4 + ext_len) : len;
-                for (size_t j = i + 4; j + 4 <= ext_end; ++j) {
-                    if (buf[j] == 'A' && buf[j + 1] == 'E' && buf[j + 2] == 'G' && buf[j + 3] == '1') {
+                if (ext_len >= 6 && i + 4 + 6 <= len) {
+                    // Check ECH outer header: outer(0x00), KDF HKDF-SHA256 (0x0020), AEAD (0x0001 or 0x0003), config_id
+                    if (buf[i + 4] == 0x00 && buf[i + 5] == 0x00 && buf[i + 6] == 0x20) {
                         return true;
                     }
                 }
@@ -99,16 +154,23 @@ public:
         return false;
     }
 
-    // In-place zero-copy unwrap for TLS 1.3 Reality ECH
+    // In-place zero-copy unwrap for TLS 1.3 Reality ECH without static wire signatures
     static inline bool strip_tls_reality_mimicry(const uint8_t*& buf, size_t& len) noexcept {
         if (!buf || len < 45 || buf[0] != 0x16) return false;
         for (size_t i = 5; i + 10 <= len; ++i) {
             if (buf[i] == 0xFE && buf[i + 1] == 0x0D) {
                 size_t ext_len = (static_cast<size_t>(buf[i + 2]) << 8) | buf[i + 3];
                 size_t ext_end = (i + 4 + ext_len < len) ? (i + 4 + ext_len) : len;
-                for (size_t j = i + 4; j + 4 <= ext_end; ++j) {
-                    if (buf[j] == 'A' && buf[j + 1] == 'E' && buf[j + 2] == 'G' && buf[j + 3] == '1') {
-                        size_t payload_start = j + 4;
+                if (ext_len >= 6 && i + 4 + 6 <= ext_end) {
+                    if (buf[i + 4] == 0x00 && buf[i + 5] == 0x00 && buf[i + 6] == 0x20) {
+                        // Standard payload offset right after ECH header (i + 10)
+                        size_t payload_start = i + 10;
+                        // Backward compatibility: skip legacy AEG1 magic if present
+                        if (payload_start + 4 <= ext_end &&
+                            buf[payload_start] == 'A' && buf[payload_start + 1] == 'E' &&
+                            buf[payload_start + 2] == 'G' && buf[payload_start + 3] == '1') {
+                            payload_start += 4;
+                        }
                         if (payload_start < ext_end) {
                             size_t payload_len = ext_end - payload_start;
                             buf += payload_start;

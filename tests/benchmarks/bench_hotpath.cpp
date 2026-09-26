@@ -8,10 +8,10 @@
 #include <iomanip>
 #include <random>
 #include <cassert>
-#include "../session_table.h"
-#include "../crypto_utils.h"
-#include "../network_security.h"
-#include "../packet_scratch.h"
+#include "session_table.h"
+#include "crypto_utils.h"
+#include "network_security.h"
+#include "packet_scratch.h"
 
 int main() {
     std::cout << "====================================================================\n";

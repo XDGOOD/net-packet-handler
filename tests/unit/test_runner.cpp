@@ -495,6 +495,33 @@ int main() {
     assert(strip_len == 32);
     assert(strip_ptr == pkt_buf1 + 24);
 
+    // Verify TLS 1.3 Reality ECH detection and zero-copy unwrap (Zero Static Signatures)
+    std::vector<uint8_t> tls_ech_pkt(80, 0);
+    tls_ech_pkt[0] = 0x16; // TLS Handshake
+    tls_ech_pkt[1] = 0x03; tls_ech_pkt[2] = 0x01; // TLS 1.2 record version
+    tls_ech_pkt[3] = 0x00; tls_ech_pkt[4] = 75;   // Record length
+    // ECH extension at offset 10: 0xFE, 0x0D
+    tls_ech_pkt[10] = 0xFE; tls_ech_pkt[11] = 0x0D;
+    size_t ech_ext_len = 50;
+    tls_ech_pkt[12] = 0x00; tls_ech_pkt[13] = static_cast<uint8_t>(ech_ext_len);
+    // ECH outer header: outer=0x00, KDF=0x0020, AEAD=0x0001, config_id=0x01
+    tls_ech_pkt[14] = 0x00;
+    tls_ech_pkt[15] = 0x00; tls_ech_pkt[16] = 0x20;
+    tls_ech_pkt[17] = 0x00; tls_ech_pkt[18] = 0x01;
+    tls_ech_pkt[19] = 0x01;
+    // Payload starts at 20 (44 bytes payload)
+    const uint8_t sample_ech_data[] = {0x11, 0x22, 0x33, 0x44, 0x55};
+    std::memcpy(&tls_ech_pkt[20], sample_ech_data, sizeof(sample_ech_data));
+
+    assert(ProtocolMimicry::is_tls_reality_mimicry(tls_ech_pkt.data(), tls_ech_pkt.size()));
+    const uint8_t* ech_strip_ptr = tls_ech_pkt.data();
+    size_t ech_strip_len = tls_ech_pkt.size();
+    assert(ProtocolMimicry::strip_tls_reality_mimicry(ech_strip_ptr, ech_strip_len));
+    assert(ech_strip_ptr == tls_ech_pkt.data() + 20);
+    assert(ech_strip_len == ech_ext_len - 6);
+    assert(std::memcmp(ech_strip_ptr, sample_ech_data, sizeof(sample_ech_data)) == 0);
+    std::cout << "  [PASS] TLS 1.3 Reality ECH: Signature-Free Unwrap (Zero 'AEG1' Signatures)" << std::endl;
+
     // Verify StatelessCookie generation and verification
     uint8_t cookie_sec[32] = {0x42};
     uint8_t cookie1[16];

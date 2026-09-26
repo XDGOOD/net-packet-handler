@@ -36,7 +36,7 @@ jobs:
 
       - name: Compile High-Performance Binaries (-O3 + LTO)
         run: |
-          cmake --build build_rel --target aegs_server aegs_client bench_hotpath bench_multicore -j$(nproc)
+          cmake --build build_rel --target aegs_server aegs_client bench_hotpath bench_multicore -j"$(nproc 2>/dev/null || echo 2)"
 
       - name: Strip Debug Symbols
         run: |

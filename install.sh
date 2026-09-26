@@ -68,7 +68,7 @@ fi
 echo -e "${C_CYAN}[3/6] Compiling AEGS Global Release Binaries with CMake (-O3)...${C_RESET}"
 mkdir -p "${SOURCE_DIR}/build"
 cmake -S "${SOURCE_DIR}" -B "${SOURCE_DIR}/build" -DCMAKE_BUILD_TYPE=Release
-cmake --build "${SOURCE_DIR}/build" -j"$(nproc)"
+cmake --build "${SOURCE_DIR}/build" -j"$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
 
 # 4. Linux Kernel High-Throughput & Low-Latency Tuning
 echo -e "${C_CYAN}[4/6] Applying 10Gbps Linux Kernel UDP & Buffer Tuning...${C_RESET}"

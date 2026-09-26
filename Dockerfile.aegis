@@ -22,7 +22,7 @@ COPY . .
 RUN cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CXX_FLAGS="-O3 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2" \
-    && cmake --build build -j"$(nproc)" --target aegs_server \
+    && cmake --build build -j"$(nproc 2>/dev/null || echo 2)" --target aegs_server \
     && strip build/aegs_server
 
 # Stage 2: Minimal Hardened Runtime

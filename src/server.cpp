@@ -231,22 +231,14 @@ ResumptionManager g_resumption;
 // FIX Client Isolation: default ON for multi-tenant security (set AEGS_CLIENT_ISOLATION=0 to disable)
 static bool g_client_isolation = true;
 
-// Blackhole-enhanced probing fallback: generates varied QUIC-like responses
+// Audit Hardening: Silent Drop of unauthorized scanner probes.
+// Eliminates UDP amplification reflection and ISP port-scanning blacklisting.
 void send_probing_fallback(int fd, const struct sockaddr_in& caddr,
                            const uint8_t* probe_data, size_t probe_len,
                            uint32_t ip_num, double now) {
-    (void)ip_num;
-    if (probe_len < BlackholeResponder::kMinProbeLen)
-        return; // Drop short probes to prevent UDP amplification reflection (Audit 4.4)
-    std::string ip = inet_ntoa(caddr.sin_addr);
-    if (!g_blackhole.should_respond(ip, now))
-        return;
-    auto resp = g_blackhole.generate_response(probe_data, probe_len);
-    if (!resp.empty()) {
-        g_blackhole.record_response(ip, resp.size());
-        sendto(fd, resp.data(), resp.size(), 0,
-               (struct sockaddr*)&caddr, sizeof(caddr));
-    }
+    (void)fd; (void)caddr; (void)probe_data; (void)probe_len;
+    (void)ip_num; (void)now;
+    // Silent drop: never reflect or amplify unauthorized traffic on the wire
 }
 
 void record_fail(int fd, const struct sockaddr_in& caddr,

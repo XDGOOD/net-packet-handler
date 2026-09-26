@@ -791,16 +791,14 @@ public final class AegsProtocol {
             ext.write(0x02);
             ext.write(0x03); ext.write(0x04);
 
-            // 5. Encrypted Client Hello (ECH, 0xfe0d) encapsulating AEGS Handshake / Frame!
+            // 5. Encrypted Client Hello (ECH, 0xfe0d) encapsulating AEGS Handshake / Frame (Zero Static Signatures)
             ext.write(0xfe); ext.write(0x0d);
-            byte[] magic = new byte[]{'A', 'E', 'G', '1'};
-            int echDataLen = 6 + magic.length + innerAegsPayload.length;
+            int echDataLen = 6 + innerAegsPayload.length;
             ext.write((echDataLen >> 8) & 0xFF); ext.write(echDataLen & 0xFF);
             ext.write(0x00);
             ext.write(0x00); ext.write(0x20);
             ext.write(0x00); ext.write(0x01);
             ext.write(0x01);
-            ext.write(magic);
             ext.write(innerAegsPayload);
 
             byte[] extBytes = ext.toByteArray();
@@ -864,9 +862,16 @@ public final class AegsProtocol {
             if ((packet[i] & 0xFF) == 0xFE && (packet[i + 1] & 0xFF) == 0x0D) {
                 int extLen = ((packet[i + 2] & 0xFF) << 8) | (packet[i + 3] & 0xFF);
                 int extEnd = Math.min(len, i + 4 + extLen);
-                for (int j = i + 4; j + 4 <= extEnd; j++) {
-                    if (packet[j] == 'A' && packet[j + 1] == 'E' && packet[j + 2] == 'G' && packet[j + 3] == '1') {
-                        int payloadStart = j + 4;
+                if (extLen >= 6 && i + 4 + 6 <= extEnd) {
+                    if ((packet[i + 4] & 0xFF) == 0x00 &&
+                        (packet[i + 5] & 0xFF) == 0x00 &&
+                        (packet[i + 6] & 0xFF) == 0x20) {
+                        int payloadStart = i + 10;
+                        if (payloadStart + 4 <= extEnd &&
+                            packet[payloadStart] == 'A' && packet[payloadStart + 1] == 'E' &&
+                            packet[payloadStart + 2] == 'G' && packet[payloadStart + 3] == '1') {
+                            payloadStart += 4;
+                        }
                         int payloadLen = extEnd - payloadStart;
                         if (payloadLen > 0) {
                             return java.util.Arrays.copyOfRange(packet, payloadStart, payloadStart + payloadLen);
