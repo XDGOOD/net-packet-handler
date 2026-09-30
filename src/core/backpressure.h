@@ -5,7 +5,7 @@
 // Prevents memory exhaustion (OOM) and Bufferbloat during traffic bursts,
 // packet drops, and transport congestion.
 //
-// In an L3 VPN tunnel, reading indefinitely from a TUN interface while the
+// In an L3 overlay tunnel, reading indefinitely from a TUN interface while the
 // outbound UDP socket buffer is congested causes severe bufferbloat, memory
 // exhaustion, and socket drops.
 //

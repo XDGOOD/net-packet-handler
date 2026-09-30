@@ -103,7 +103,7 @@ std::vector<std::string> KillSwitch::generate_windows_rules(const std::string& s
     rules.push_back("netsh advfirewall firewall add rule name=\"AEGS_Allow_Loopback\" dir=out action=allow remoteip=127.0.0.1");
     // 3. Allow DHCP
     rules.push_back("netsh advfirewall firewall add rule name=\"AEGS_Allow_DHCP\" dir=out action=allow protocol=UDP localport=68 remoteport=67");
-    // 4. Default outbound block during VPN active killswitch
+    // 4. Default outbound block during active killswitch
     rules.push_back("netsh advfirewall set currentprofiles firewallpolicy blockinbound,blockoutbound");
     return rules;
 }
@@ -127,7 +127,7 @@ std::vector<std::string> KillSwitch::generate_rules(const std::string& server_ip
     // 3. Allow all traffic on loopback interface
     rules.push_back("iptables -A " + chain + " -o lo -j ACCEPT");
 
-    // 4. Allow all traffic on the VPN TUN interface
+    // 4. Allow all traffic on the TUN interface
     rules.push_back("iptables -A " + chain + " -o " + tun_iface + " -j ACCEPT");
 
     // 5. Allow DHCP client traffic (prevent losing local DHCP lease)
@@ -344,13 +344,13 @@ std::vector<std::string> DnsLeakProtector::generate_rules(const std::string& tun
     std::string chain = "AEGS_DNS_SHIELD";
 
     rules.push_back("iptables -N " + chain);
-    // Allow DNS queries over the VPN interface
+    // Allow DNS queries over the tunnel interface
     rules.push_back("iptables -A " + chain + " -o " + tun_iface + " -p udp --dport 53 -j ACCEPT");
     rules.push_back("iptables -A " + chain + " -o " + tun_iface + " -p tcp --dport 53 -j ACCEPT");
     // Allow local DNS (e.g. systemd-resolved on 127.0.0.53 or dnsmasq on 127.0.0.1)
     rules.push_back("iptables -A " + chain + " -o lo -p udp --dport 53 -j ACCEPT");
     rules.push_back("iptables -A " + chain + " -o lo -p tcp --dport 53 -j ACCEPT");
-    // Block all plaintext DNS requests on non-VPN physical interfaces (prevent ISP leak)
+    // Block all plaintext DNS requests on non-tunnel physical interfaces (prevent ISP leak)
     rules.push_back("iptables -A " + chain + " -p udp --dport 53 -j DROP");
     rules.push_back("iptables -A " + chain + " -p tcp --dport 53 -j DROP");
     // Insert into OUTPUT chain

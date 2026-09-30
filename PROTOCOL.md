@@ -1,9 +1,9 @@
-# AEGS v4 Pantheon Protocol Specification
+# AEGS v6 Titan Protocol Specification
 
 ## 1. Introduction
-- Problem: stateful DPI systems (ТСПУ, GFW, Cloudflare Magic Firewall) identify VPN protocols by static signatures and flow behavior
-- Solution: AEGS v4 — transport protocol with per-packet randomized wire format, header masking, and behavioral evasion
-- Scope: UDP transport, IPv4 tunneling, multi-user
+- Problem: Deep Packet Inspection (DPI) and intrusive middleboxes tamper with or inspect network transport protocols using static signatures and heuristic pattern matching
+- Solution: AEGS v6 — Secure network transport overlay with per-packet randomized wire format, dynamic header protection, and privacy-preserving flow framing
+- Scope: UDP transport, IPv4 encapsulation, multi-device access control
 
 ## 2. Terminology
 - Token: 256-bit pre-shared secret (user credential)
@@ -150,7 +150,7 @@ After successful ECDH handshake, server issues a **ResumptionToken** (96 bytes):
 
 ### 11.1 Hardware Kill-Switch Isolation
 Strict firewall isolation (`iptables` on Linux, WinFilter on Windows) ensures zero packet leaks if the tunnel drops:
-- Dedicated chain `AEGS_KILLSWITCH` drops all traffic on physical interfaces except tunnel, loopback, DHCP, and VPN server port range.
+- Dedicated chain `AEGS_KILLSWITCH` drops all traffic on physical interfaces except tunnel, loopback, DHCP, and AEGS server port range.
 
 ### 11.2 DNS Leak Protection Shield
 Blocks all unencrypted port 53 traffic across external physical adapters, enforcing exclusive resolution through internal tunnel DNS (`10.8.0.1`).

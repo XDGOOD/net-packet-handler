@@ -1,103 +1,263 @@
-# AEGS v6 "Titan" — Ultra High-Speed Stealth Protocol 🛡️⚡
+# AEGS Titan — Защищенный оверлейный сетевой протокол
 
-[![Language](https://img.shields.io/badge/Language-C%2B%2B17-blue.svg)](#)
-[![License](https://img.shields.io/badge/License-MIT-purple.svg)](#)
-[![Edition](https://img.shields.io/badge/Edition-v6.0%20Titan-blueviolet.svg)](#)
-[![Status](https://img.shields.io/badge/Status-Release%20Ready-success.svg)](#)
+[![Language](https://img.shields.io/badge/Language-C%2B%2B17%20%2F%20C%2B%2B20-blue.svg)](CMakeLists.txt)
+[![Platform](https://img.shields.io/badge/Platforms-Linux%20%7C%20Android%20%7C%20Windows-green.svg)](#клиентские-приложения-и-загрузка)
+[![Security](https://img.shields.io/badge/Crypto-ChaCha20--Poly1305%20%7C%20X25519-orange.svg)](PROTOCOL.md)
+[![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE)
 
-> ⚡ **AEGS v6 Titan Core Edition** — высокоскоростной (300–900+ Мбит/с), криптографически стойкий транспортный протокол с полной защитой от блокировок DPI и ТСПУ. Предназначен для развертывания на персональных серверах, домашних роутерах (OpenWrt) и рабочих станциях.
-> 
-> 🌐 **Мобильное приложение (Android APK) и распределённый кластер (10+ Гбит/с):**  
-> Официальное мобильное приложение и разработка enterprise multi-node архитектуры ведутся в репозитории: **[AEGS Global Edition (XDGOOD/AEGS-Global-)](https://github.com/XDGOOD/AEGS-Global-)**.
+Криптографически стойкий оверлейный транспортный протокол (**Net Packet Handler**), спроектированный для безопасной конфиденциальной передачи данных, оптимизации сетевых потоков, нулевой сигнатурной заметности и отказоустойчивой связи в нестабильных сетях.
 
----
-
-## 🧠 Что такое AEGS v6 Titan?
-
-**AEGS** — это защищённый транспортный протокол нового поколения, спроектированный для преодоления систем глубокой фильтрации пакетов (DPI, ТСПУ, GFW, Cloudflare Magic Firewall) и статистических анализаторов трафика (Anti-ML / AI), которые легко блокируют стандартные протоколы WireGuard, OpenVPN и простые обфускации.
+Репозиторий включает серверное ядро на C++, кроссплатформенный клиентский стек, нативное мобильное приложение под Android и архитектурную базу настольного клиента Windows.
 
 ---
 
-## 🛡 Архитектура и технологии скрытности
+## Оглавление
 
-### 1. 🧠 State-Machine Pre-Bypass («AEGS Illusion»)
-Перед отправкой `HANDSHAKE_INIT` клиент передает 1–3 decoy-пакета, точно имитирующих **RFC 5389 STUN Binding Requests** или **RFC 9000 QUIC Initial** (≥1200 байт). DPI классифицирует соединение как доверенный WebRTC/STUN или HTTP/3 трафик и отключает углубленный анализ потока.
-
-### 2. 🎭 Семантический паддинг («Bimodal Shaping» — Anti-ML)
-Вместо равномерного случайного шума протокол формирует бимодальный профиль реального видеостриминга:
-* Малые пакеты (≤200 B: ACK, DNS, TCP SYN) дополняются до **~256 B** (профиль QUIC ACK).
-* Большие пакеты (>200 B) дополняются до **~1350 B** (полный MTU QUIC).
-* 5% случайного шума (512–768 B) для защиты от фингерпринтинга распределения.
-
-### 3. 👻 Active Chaffing (Защита от тайминг-анализа)
-При простое канала (>500 мс) клиент генерирует зашифрованные фиктивные chaff-пакеты (флаг `0x80`). Сервер проверяет криптографическую подпись Poly1305 и бесшумно отбрасывает их. Для провайдера туннель выглядит как непрерывный видеозвонок или голосовая сессия.
-
-### 4. 🛡 Cryptographic Blackhole (Защита от активного сканирования)
-При получении некорректных зондов от сетевых сканеров сервер отвечает аутентичными QUIC-пакетами (Version Negotiation, Retry, Connection Close) с нулевым коэффициентом усиления (0.0x amplification на мелкие зонды).
-
-### 5. 🔀 Port Hopping
-Периодическая смена UDP-портов по алгоритму HMAC-SHA256 на основе сессионного ключа для обхода точечной блокировки портов.
-
-### 6. ⚡ Zero-RTT Session Resumption
-Мгновенное возобновление сессии (<5 мс) по зашифрованному 96-байтному `ResumptionToken` без повторного тяжелого вычисления Curve25519 ECDH.
-
-### 7. 🔒 Fail-Closed Kill-Switch & DNS Leak Shield
-Аппаратная изоляция через выделенные цепочки сетевого фильтра (iptables / WinFilter) с блокировкой открытого 53 порта и принудительным туннельным DNS (`10.8.0.1`).
+1. [Ключевые особенности](#ключевые-особенности)
+2. [Структура проекта](#структура-проекта)
+3. [Развертывание сервера (Linux VPS)](#развертывание-сервера-linux-vps)
+4. [Управление доступом (`manage.sh`)](#управление-доступом-managesh)
+5. [Формат пакетов на проводе](#формат-пакетов-на-проводе-wire-specification)
+6. [Тестирование и валидация](#тестирование-и-валидация-run_testspy)
+7. [Диагностика и мониторинг](#диагностика-и-мониторинг)
+8. [Клиентские приложения и загрузка](#клиентские-приложения-и-загрузка)
+9. [Лицензия](#лицензия)
 
 ---
 
-## 📡 Спецификация пакетов на проводе
+## Ключевые особенности
 
-* **HANDSHAKE_INIT** (72 байта): `type(1)` + `reserved(7)` + `key_id(8)` + `ephemeral_pk(32)` + `timestamp_ms(8)` + `mac(16, HMAC-SHA256(MasterKey))`
-* **HANDSHAKE_RESP** (80 байт): `type(1)` + `reserved(7)` + `session_id(8)` + `server_epk(32)` + `encrypted_config(16)` + `aead_tag(16, Poly1305)`
-* **DATA packet**: `hdr_iv(12)` + `masked_hdr(16, ChaCha20)` + `[junk/chaff]` + `aead_nonce(12)` + `ChaCha20-Poly1305(frame)`
-* **Frame**: `plen(2)` + `ip_packet(plen)` + `bimodal_padding` (целевые ~256B / ~1350B)
-
----
-
-## 📊 Сравнительная таблица
-
-| Функция | WireGuard | AmneziaWG | XTLS-Reality | **AEGS v6 Titan** |
-|---|---|---|---|---|
-| Сигнатура заголовка на проводе | ❌ Статическая | ⚠️ Маскированная | N/A (TCP) | ✅ **Zero signatures (рандомный IV + маска)** |
-| Обход DPI State-Machine | ❌ Нет | ⚠️ Случайный мусор | ⚠️ TLS ClientHello | ✅ **Illusion (RFC 5389 STUN + RFC 9000 QUIC)** |
-| Мимикрия протокола | ❌ Нет | ❌ Нет | ⚠️ TLS | ✅ **RFC 9000/9369 QUIC Initial Evasion** |
-| Защита от нейросетей (Pad) | ❌ Нет | ⚠️ Равномерный | ❌ Нет | ✅ **Бимодальный шейпинг (~256B / ~1350B)** |
-| Защита от тайминг-анализа | ❌ Нет | ❌ Нет | ❌ Нет | ✅ **Active Chaffing (флаг 0x80)** |
-| Защита от активных сканеров | ❌ Нет | ⚠️ DNS FORMERR | ✅ TLS Camouflage | ✅ **Cryptographic Blackhole (0.0x amp)** |
-| Perfect Forward Secrecy (PFS) | ✅ Noise IK | ✅ Noise IK | ✅ TLS 1.3 | ✅ **X25519 ECDH на каждую сессию + 0-RTT** |
-| Пакетный конвейер | ⚠️ Стандартный | ⚠️ Стандартный | ⚠️ Стандартный | ✅ **Zero-Copy `sendmmsg`/`recvmmsg` (до 900+ Мбит/с)** |
-| Jumbo MTU | ❌ До 1420B | ❌ До 1420B | ❌ Стандартный | ✅ **До 9000B Jumbo MTU + AIMD Pacing** |
+* **Нулевая сигнатурная заметность (Zero-Signature)**:
+  Каждый сетевой пакет начинается со случайного 12-байтного вектора инициализации (`hdr_iv`), а 16-байтный заголовок пакета маскируется потоковым шифром ChaCha20. В потоке отсутствуют фиксированные заголовки, магические байты и предсказуемые паттерны.
+* **Современный криптографический стек**:
+  * **Аутентификация рукопожатия**: HMAC-SHA256 на основе MasterKey (деривация PBKDF2-HMAC-SHA256 с солью KeyID, 200 000 итераций). Защита от Replay-атак по временным меткам со скользящим окном.
+  * **Perfect Forward Secrecy (PFS)**: Ephemeral Curve25519 (X25519 ECDH) на каждую сессию.
+  * **Шифрование данных**: ChaCha20-Poly1305 (RFC 8439) с аутентификацией данных (AEAD).
+  * **0-RTT Session Resumption**: мгновенное восстановление прерванной сессии без повторного тяжелого вычисления асимметричной криптографии.
+* **Стойкость к статистическому и эвристическому анализу**:
+  * **Обрамление сессий (TLS 1.3 Reality & AppData Framing)**: легитимная инкапсуляция дейтаграмм в структуры TLS 1.3 на порту 443, обеспечивающая бесперебойную доставку пакетов.
+  * **Бимодальный паддинг**: динамическое сглаживание длин пакетов под профили реального веб- и мультимедиа-трафика (кластеры ~256 B и ~1350 B).
+  * **Active Chaffing**: адаптивная фоновая генерация криптографически неотличимых фиктивных пакетов при простое для сокрытия паттернов активности.
+  * **Cryptographic Blackhole**: защита от активного сетевого сканирования без коэффициента усиления ответа (RFC 9000 §8.1 anti-amplification).
+  * **Port Hopping**: опциональная псевдослучайная ротация сетевых портов.
+* **Высокая производительность и защита от перегрузок**:
+  * **AIMD Adaptive Egress Pacing**: встроенный контроллер противодавления (`BackpressureController`), предотвращающий Bufferbloat, переполнение сокетов и исчерпание памяти (OOM) при всплесках потерь пакетов.
+  * Пакетный I/O через системные вызовы `recvmmsg` / `sendmmsg` в Linux.
+  * Неблокирующие алгоритмы (Lock-Free / RCU snapshots) на горячем пути обработки пакетов.
+  * Маршрутизация на уровне ядра через виртуальный интерфейс (`aegs0`, подсеть `10.8.0.0/24`) с NAT MASQUERADE.
 
 ---
 
-## 🚀 Быстрый запуск
+## Структура проекта
 
-### Сервер (Linux)
+```text
+net-packet-handler/
+├── src/                    # Исходный код C++
+│   ├── server.cpp          # Серверное ядро (epoll, recvmmsg, сессии, маршрутизация TUN)
+│   ├── client.cpp          # Клиентская реализация (сетевой сокет, шифрование, фрейминг)
+│   ├── core/               # Таблицы сессий (RCU), AIMD Backpressure, 0-RTT resumption
+│   ├── crypto/             # X25519, ChaCha20-Poly1305, HKDF, PBKDF2
+│   ├── net/                # Виртуальный интерфейс TUN, пул IP, автоматический NAT, KillSwitch
+│   └── stealth/            # Маскировка заголовков, Port Hopper, Chaffing, Traffic Shaper
+├── include/                # Заголовочные файлы протокола и конфигурации
+├── android/                # Исходный код мобильного клиента Android (Titan)
+│   ├── app/src/main/java/  # Java: сетевой оверлей, AegsProtocol, UI, умная маршрутизация
+│   ├── app/src/main/res/   # Графические ресурсы, разметка интерфейса, стили
+│   └── build.gradle        # Конфигурация сборки Gradle
+├── scripts/                # Скрипты развертывания и управления
+│   ├── manage.sh           # CLI-утилита управления сервером и учетными записями
+│   └── aegs_openwrt.sh     # Скрипт настройки клиента для роутеров OpenWrt
+├── tests/                  # Модульные тесты, стресс-тесты, криптографическая валидация
+├── CMakeLists.txt          # Конфигурация сборки CMake (C++17/20)
+├── Dockerfile.aegis        # Контейнеризация сервера
+└── docker-compose.yml      # Развертывание в Docker
+```
+
+---
+
+## Развертывание сервера (Linux VPS)
+
+### Системные требования
+* ОС: Linux (Debian 11/12/13, Ubuntu 20.04/22.04/24.04, Alpine, CentOS Stream)
+* Зависимости: компилятор C++17/20 (`g++` или `clang++`), `cmake`, `libssl-dev`, `libsqlite3-dev`, `iptables`
+
 ```bash
-git clone https://github.com/XDGOOD/net-packet-handler
+# Установка зависимостей (Debian / Ubuntu)
+sudo apt update && sudo apt install -y build-essential cmake libssl-dev libsqlite3-dev iptables
+```
+
+### Вариант 1. Автоматическая установка через `manage.sh`
+
+Скрипт автоматически компилирует проект, инициализирует базу данных SQLite, настраивает сетевые правила iptables и регистрирует системную службу:
+
+```bash
+git clone https://github.com/XDGOOD/net-packet-handler.git
 cd net-packet-handler
-./manage.sh install        # Сборка, настройка сети и запуск службы systemd
-./manage.sh add-user alice # Добавление пользователя и вывод токена
+
+# Полная установка и запуск службы
+sudo ./manage.sh install
+
+# Создание ключа доступа для первого устройства
+sudo ./manage.sh add-user myphone
+
+# Проверка статуса
+sudo ./manage.sh status
 ```
 
-### Клиенты
+### Вариант 2. Ручная компиляция
 
-* **Windows:** Запустите `tools/AEGS.bat` или графический интерфейс `tools/aegs_app.py`.
-* **Домашний роутер (OpenWrt):** Выполните `scripts/aegs_openwrt.sh`.
-* **Linux / macOS (CLI):**
-  ```bash
-  ./build/aegis_client <IP_СЕРВЕРА> 50001 <ВАШ_ТОКЕН>
-  ```
-* **Мобильный клиент Android:**  
-  Доступен в официальном репозитории **[XDGOOD/AEGS-Global-](https://github.com/XDGOOD/AEGS-Global-)**.
+```bash
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target aegs_server aegs_client -j$(nproc)
+sudo install -m 755 build/aegs_server /usr/local/bin/aegs_server
+```
 
 ---
 
-## 🧪 Тестирование и верификация
+## Управление доступом (`manage.sh`)
 
-Запуск полного тестового набора безопасности и устойчивости к атакам:
-```bash
-python tests/test_suite_v4.py
-python tests/run_attack_tests.py
+Управление учетными записями и ключами осуществляется через встроенную утилиту:
+
+| Команда | Назначение |
+|---|---|
+| `sudo ./manage.sh add-user <имя>` | Создает учетную запись и генерирует персональный ключ доступа |
+| `sudo ./manage.sh list-users` | Отображает список активных пользователей и их KeyID |
+| `sudo ./manage.sh show-user <имя>` | Показывает строку подключения и QR-параметры |
+| `sudo ./manage.sh remove-user <имя>` | Отзывает доступ и удаляет ключ из базы |
+| `sudo ./manage.sh logs` | Просмотр системного журнала службы в реальном времени |
+| `sudo ./manage.sh restart` | Перезапуск службы `aegs-server.service` |
+
+---
+
+## Формат пакетов на проводе (Wire Specification)
+
+### Рукопожатие: `HANDSHAKE_INIT` (72 байта)
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Type (0x01)  |                   Reserved                    |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                            KeyID                              |
+|                          (8 bytes)                            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                 Client Ephemeral Public Key                   |
+|                      (X25519, 32 bytes)                       |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                         Timestamp (ms)                        |
+|                          (uint64_be)                          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                           Auth MAC                            |
+|             (HMAC-SHA256(MasterKey, bytes[0..56])[:16])       |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
+
+### Ответ сервера: `HANDSHAKE_RESP` (80 байт)
+
+* `Type (0x02)` (1 B) + `Reserved` (7 B)
+* `SessionID` (8 B) — уникальный идентификатор сессии
+* `Server Ephemeral Public Key` (32 B) — эфемерный публичный ключ X25519
+* `Encrypted Config` (16 B) — `Assigned IP` (4 B) + `MTU` (2 B) + `ZeroPadding` (10 B), зашифровано ключом `ConfigKey`
+* `Poly1305 Tag` (16 B) — аутентификационный тег целостности
+
+### Пакет данных (DATA Packet)
+
+```text
+[12B Header IV] [16B ChaCha20 Masked Header] [Junk/Chaff] [12B AEAD Nonce] [ChaCha20-Poly1305 Ciphertext]
+```
+
+1. **Header IV (12 B)**: случайный вектор инициализации в начале каждого пакета.
+2. **Masked Header (16 B)**: зашифрован `MaskKey` с `Header IV`. Содержит `KeyID` (8 B), `JunkLen` (2 B), флаги (бит Chaff `0x80`) и протокольную метку `VER_MAGIC`.
+3. **AEAD Nonce (12 B)**: 64-битный монотонный счетчик пакетов (Sequence Number) + 4 байта случайного префикса сессии.
+4. **Ciphertext**: зашифрованный фрейм IP-пакета с бимодальным семантическим паддингом.
+
+---
+
+## Тестирование и валидация (`run_tests.py`)
+
+Проект оснащен модульным тестовым фреймворком для комплексной верификации криптографии и сетевой устойчивости:
+
+```bash
+# Запуск комплексного аудита всех блоков (21 тест)
+python run_tests.py --all
+
+# Выборочные тесты:
+python run_tests.py --crypto    # Блок 1: RFC 8439 KAT, деривация ключей, целостность AAD
+python run_tests.py --attack    # Блок 2: Симуляция атак (Bit-Flip, Replay, Amplification factor)
+python run_tests.py --live      # Блок 3: Тестирование живого соединения (Handshake + DNS Roundtrip)
+python run_tests.py --bench     # Блок 4: Измерение пропускной способности (PPS / Мбит/с)
+python run_tests.py --chaos     # Блок 5: Стресс-тестирование и фаззинг искаженными дейтаграммами
+```
+
+---
+
+## Диагностика и мониторинг
+
+```bash
+# Проверка статуса службы
+systemctl status aegs-server.service
+
+# Журнал событий в реальном времени
+journalctl -u aegs-server.service -f
+
+# Проверка сетевого интерфейса
+ip -br addr show aegs0
+
+# Мониторинг прослушиваемых UDP-портов
+ss -ulpn | grep 50001
+
+# Проверка правил трансляции адресов NAT
+sudo iptables -t nat -L POSTROUTING -n -v | grep aegs0
+```
+
+---
+
+## Клиентские приложения и загрузка
+
+### 1. Мобильное приложение для Android (Titan)
+
+Нативный клиент с интуитивным графическим интерфейсом и аппаратно оптимизированным сетевым сервисом.
+
+* **Возможности**:
+  * Полная реализация протокола AEGS v6 на чистой Java (без тяжелых внешних зависимостей).
+  * 4 режима маскировки: Стелс-режим Reality ECH, Fast Emergency 0-RTT, Turbo PQC, Hybrid Auto.
+  * Умная маршрутизация (Smart Split-Routing): автоматический прямой доступ (Direct) для отечественных сервисов и банков на максимальной скорости домашнего провайдера.
+  * Аппаратная защита от сетевых утечек на уровне ядра Linux (`setBlocking(true)`).
+  * Бесшовный роуминг Wi-Fi / LTE (`setUnderlyingNetworks`) без разрыва активных соединений.
+  * Отображение входящей и исходящей скорости в строке состояния.
+* **Установка и загрузка**:
+  * Готовый установочный файл `.apk` доступен для загрузки в разделе [Releases](https://github.com/XDGOOD/net-packet-handler/releases).
+  * Автоматическая сборка свежих релизов настроена через GitHub Actions ([`.github/workflows/release_builds.yml`](.github/workflows/release_builds.yml)).
+  * Самостоятельная сборка из исходников:
+    ```bash
+    cd android
+    ./gradlew assembleRelease
+    ```
+
+### 2. Клиент для Windows (ПК-версия)
+
+Находится в стадии активной разработки и подготовки релиза:
+* **Архитектура**: высокопроизводительный сетевой сервис на базе драйвера **Wintun L3** (высокоскоростной виртуальный адаптер уровня ядра с кольцевым буфером ring-0).
+* **Сетевой стек**: асинхронный сокетный ввод-вывод через `Winsock2` / `IOCP`, полная интеграция с ядром протокола на C++.
+* **Интерфейс**: компактное приложение в системном трее Windows с быстрым переключением профилей, счетчиком скорости и автоматическим правилом изоляции через Windows Filtering Platform (WFP / `netsh`).
+
+### 3. Клиент для Linux и домашних роутеров (OpenWrt)
+
+* **Linux CLI**:
+  ```bash
+  cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+  cmake --build build --target aegs_client -j$(nproc)
+  sudo ./build/aegs_client <IP_СЕРВЕРА> 50001 <ТОКЕН>
+  ```
+* **Роутеры OpenWrt**:
+  ```bash
+  scp scripts/aegs_openwrt.sh root@192.168.1.1:/tmp/
+  ssh root@192.168.1.1 "bash /tmp/aegs_openwrt.sh install <IP_СЕРВЕРА> 50001 <ТОКЕН>"
+  ```
+
+---
+
+## Лицензия
+
+Проект распространяется под открытой лицензией [MIT License](LICENSE).

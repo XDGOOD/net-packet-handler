@@ -26,7 +26,7 @@ IpPool::IpPool(const std::string& network_cidr) {
         throw std::invalid_argument("Invalid CIDR prefix");
     }
     if (prefix < 16 || prefix > 30) {
-        throw std::invalid_argument("CIDR prefix must be between /16 and /30 for VPN IP pool");
+        throw std::invalid_argument("CIDR prefix must be between /16 and /30 for IP pool");
     }
 
     uint32_t ip;

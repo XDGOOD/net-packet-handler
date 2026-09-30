@@ -468,8 +468,16 @@ public final class AegsProtocol {
     public static HandshakeResult processHandshakeResp(
             byte[] resp, int len, byte[] keyId, byte[] masterKey, byte[] clientPriv) throws Exception {
 
-        // Auto-detect and strip RFC 9000 QUIC mimicry (24-byte Long Header)
-        if (len >= 24 + 80 && (resp[0] & 0x80) != 0 && (resp[5] & 0xFF) == 0x08 && (resp[14] & 0xFF) == 0x08 && resp[23] == 0x00) {
+        // Auto-detect and strip TLS 1.3 Application Data framing (5-byte Record Header 0x17 0x03 0x03)
+        if (len >= 5 + 80 && resp[0] == 0x17 && resp[1] == 0x03 && resp[2] == 0x03) {
+            int recLen = ((resp[3] & 0xFF) << 8) | (resp[4] & 0xFF);
+            if (recLen >= 80 && recLen <= len - 5) {
+                byte[] unwrapped = new byte[recLen];
+                System.arraycopy(resp, 5, unwrapped, 0, recLen);
+                resp = unwrapped;
+                len = unwrapped.length;
+            }
+        } else if (len >= 24 + 80 && (resp[0] & 0x80) != 0 && (resp[5] & 0xFF) == 0x08 && (resp[14] & 0xFF) == 0x08 && resp[23] == 0x00) {
             byte[] unwrapped = new byte[len - 24];
             System.arraycopy(resp, 24, unwrapped, 0, len - 24);
             resp = unwrapped;
@@ -631,8 +639,16 @@ public final class AegsProtocol {
 
     public static byte[] parseDataPacket(byte[] packet, int len, byte[] keyId, byte[] maskKey,
                                          byte[] altMaskKey, byte[] recvKey) throws Exception {
-        // Auto-detect and strip RFC 9000 QUIC mimicry (24-byte Long Header)
-        if (len >= 24 && (packet[0] & 0x80) != 0 && packet[5] == 0x08 && packet[14] == 0x08 && packet[23] == 0x00) {
+        // Auto-detect and strip TLS 1.3 Application Data framing (5-byte Record Header 0x17 0x03 0x03)
+        if (len >= 5 && packet[0] == 0x17 && packet[1] == 0x03 && packet[2] == 0x03) {
+            int recLen = ((packet[3] & 0xFF) << 8) | (packet[4] & 0xFF);
+            if (recLen > 0 && recLen <= len - 5) {
+                byte[] unwrapped = new byte[recLen];
+                System.arraycopy(packet, 5, unwrapped, 0, recLen);
+                packet = unwrapped;
+                len = unwrapped.length;
+            }
+        } else if (len >= 24 && (packet[0] & 0x80) != 0 && packet[5] == 0x08 && packet[14] == 0x08 && packet[23] == 0x00) {
             byte[] unwrapped = new byte[len - 24];
             System.arraycopy(packet, 24, unwrapped, 0, len - 24);
             packet = unwrapped;
@@ -750,10 +766,46 @@ public final class AegsProtocol {
     // =========================================================================
     // TLS 1.3 Reality Camouflage Engine with Encrypted Client Hello (ECH)
     // =========================================================================
-    public static final String DEFAULT_REALITY_SNI = "www.cloudflare.com";
+    public static final String DEFAULT_REALITY_SNI = "vk.com";
+    public static final String[] WHITELIST_SNI_POOL = new String[]{
+            "vk.com",
+            "ya.ru",
+            "yastatic.net",
+            "dl.google.com"
+    };
+
+    public static String getRandomWhitelistSni() {
+        return WHITELIST_SNI_POOL[CSPRNG.nextInt(WHITELIST_SNI_POOL.length)];
+    }
+
+    public static byte[] wrapTlsAppData(byte[] payload, int len) {
+        if (payload == null || len <= 0 || len > 0xFFFF) return payload;
+        byte[] record = new byte[5 + len];
+        record[0] = 0x17; // TLS 1.3 Application Data ContentType
+        record[1] = 0x03; // Legacy Version 0x0303 (TLS 1.2 wire format per RFC 8446)
+        record[2] = 0x03;
+        record[3] = (byte) ((len >> 8) & 0xFF);
+        record[4] = (byte) (len & 0xFF);
+        System.arraycopy(payload, 0, record, 5, len);
+        return record;
+    }
+
+    public static byte[] stripTlsAppData(byte[] packet, int len) {
+        if (packet != null && len >= 5 && packet[0] == 0x17 && packet[1] == 0x03 && packet[2] == 0x03) {
+            int recLen = ((packet[3] & 0xFF) << 8) | (packet[4] & 0xFF);
+            if (recLen > 0 && recLen <= len - 5) {
+                byte[] unwrapped = new byte[recLen];
+                System.arraycopy(packet, 5, unwrapped, 0, recLen);
+                return unwrapped;
+            }
+        }
+        return null;
+    }
 
     public static byte[] buildTlsRealityClientHello(byte[] innerAegsPayload, String sni) {
-        if (sni == null || sni.isEmpty()) sni = DEFAULT_REALITY_SNI;
+        if (sni == null || sni.isEmpty() || "www.cloudflare.com".equals(sni)) {
+            sni = getRandomWhitelistSni();
+        }
         try {
             java.io.ByteArrayOutputStream ext = new java.io.ByteArrayOutputStream();
 

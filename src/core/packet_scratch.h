@@ -100,6 +100,34 @@ struct PacketScratch {
         tx_count++;
     }
 
+    void queue_tx_tls_appdata(int fd, const struct sockaddr_in& addr, const uint8_t* payload, size_t len) noexcept {
+        if (tx_count >= MAX_BATCH) return;
+        if (len + ProtocolMimicry::kTlsRecordHeaderSize > TX_SLOT_SIZE) {
+            dropped_oversized++;
+            return;
+        }
+        auto& slot = tx_slots[tx_count];
+        slot.fd = fd;
+        slot.addr = addr;
+        slot.retries = 0;
+        std::memcpy(slot.data, payload, len);
+        size_t wrapped_len = ProtocolMimicry::wrap_tls_appdata(slot.data, len, sizeof(slot.data));
+        slot.len = wrapped_len;
+        slot.iov.iov_base = slot.data;
+        slot.iov.iov_len = wrapped_len;
+
+#ifdef __linux__
+        auto& m = batch_msgs[tx_count];
+        std::memset(&m, 0, sizeof(m));
+        m.msg_hdr.msg_name = &slot.addr;
+        m.msg_hdr.msg_namelen = sizeof(slot.addr);
+        m.msg_hdr.msg_iov = &slot.iov;
+        m.msg_hdr.msg_iovlen = 1;
+#endif
+
+        tx_count++;
+    }
+
     // Flush queued packets using sendmmsg (Linux) or sendto
     // Retains unsent packet slots on partial sendmmsg or socket congestion (EAGAIN/ENOBUFS)
     // ZERO-COPY: passes &batch_msgs[cur] directly to sendmmsg without stack copies

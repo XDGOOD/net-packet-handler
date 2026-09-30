@@ -87,7 +87,7 @@ uint32_t TrafficShaper::next_delay_us() noexcept {
 //   • Occasional medium packets (5%) to add noise
 //
 // This defeats ML classifiers that rely on packet-size distributions to
-// distinguish VPN traffic from legitimate QUIC/HTTP3 browsing.
+// distinguish tunnel traffic from legitimate QUIC/HTTP3 browsing.
 // ---------------------------------------------------------------------------
 size_t TrafficShaper::semantic_pad(size_t actual_payload_len) noexcept {
     if (!semantic_enabled_)

@@ -27,6 +27,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 class ProtocolMimicry {
 public:
@@ -193,6 +194,53 @@ public:
         return false;
     }
 
+    // ---------------------------------------------------------------------------
+    // TLS 1.3 Application Data Framing (Factor A: TSPU Whitelist Bypass)
+    // Wire format: 0x17 0x03 0x03 [len_hi] [len_lo] [AEGS Encrypted Payload]
+    // ---------------------------------------------------------------------------
+    static constexpr uint8_t kTlsContentTypeAppData = 0x17;
+    static constexpr size_t  kTlsRecordHeaderSize   = 5;
+
+    // Checks whether an incoming buffer is framed with a TLS 1.3 Application Data header
+    static inline bool is_tls_appdata_mimicry(const uint8_t* buf, size_t len) noexcept {
+        if (!buf || len < kTlsRecordHeaderSize) return false;
+        if (buf[0] != kTlsContentTypeAppData || buf[1] != 0x03 || buf[2] != 0x03) return false;
+        uint16_t rec_len = (static_cast<uint16_t>(buf[3]) << 8) | buf[4];
+        return (rec_len > 0 && kTlsRecordHeaderSize + rec_len <= len);
+    }
+
+    // In-place zero-copy unwrap for TLS 1.3 Application Data record
+    static inline bool strip_tls_appdata_mimicry(const uint8_t*& buf, size_t& len) noexcept {
+        if (!buf || len < kTlsRecordHeaderSize) return false;
+        if (buf[0] != kTlsContentTypeAppData || buf[1] != 0x03 || buf[2] != 0x03) return false;
+        uint16_t rec_len = (static_cast<uint16_t>(buf[3]) << 8) | buf[4];
+        if (rec_len == 0 || kTlsRecordHeaderSize + rec_len > len) return false;
+        buf += kTlsRecordHeaderSize;
+        len = rec_len;
+        return true;
+    }
+
+    static inline bool strip_tls_appdata_mimicry(uint8_t*& buf, size_t& len) noexcept {
+        const uint8_t* cbuf = buf;
+        if (strip_tls_appdata_mimicry(cbuf, len)) {
+            buf = const_cast<uint8_t*>(cbuf);
+            return true;
+        }
+        return false;
+    }
+
+    // Direct helper to wrap a buffer with a TLS 1.3 Application Data record header (0x17 0x03 0x03)
+    static inline size_t wrap_tls_appdata(uint8_t* buf, size_t data_len, size_t buf_capacity) noexcept {
+        if (!buf || buf_capacity < kTlsRecordHeaderSize || data_len + kTlsRecordHeaderSize > buf_capacity || data_len > 0xFFFF)
+            return data_len;
+        std::memmove(buf + kTlsRecordHeaderSize, buf, data_len);
+        buf[0] = kTlsContentTypeAppData;
+        buf[1] = 0x03;
+        buf[2] = 0x03;
+        buf[3] = static_cast<uint8_t>((data_len >> 8) & 0xFF);
+        buf[4] = static_cast<uint8_t>(data_len & 0xFF);
+        return data_len + kTlsRecordHeaderSize;
+    }
 
     explicit ProtocolMimicry(Mode mode = Mode::NONE, uint32_t quic_version = 0) noexcept;
 

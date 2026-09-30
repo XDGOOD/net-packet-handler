@@ -39,19 +39,22 @@ jobs:
       - name: Find and Rename APK
         run: |
           mkdir -p output_apk
-          find android/app/build/outputs/apk/ -name "*.apk" -exec cp {} output_apk/AEGS-v6.0-titan.apk \;
+          find android/app/build/outputs/apk/ -name "*.apk" -exec cp {} output_apk/AEGS-v6.5-titan.apk \;
+          cp output_apk/AEGS-v6.5-titan.apk output_apk/AEGS-v6.0-titan.apk
           ls -la output_apk/
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AEGS-v6.0-titan-apk
-          path: output_apk/AEGS-v6.0-titan.apk
+          name: AEGS-v6.5-titan-apk
+          path: output_apk/*.apk
 
-      - name: Attach APK to GitHub Release v6.0-titan
+      - name: Attach APK to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v6.0-titan
-          files: output_apk/AEGS-v6.0-titan.apk
+          files: |
+            output_apk/AEGS-v6.5-titan.apk
+            output_apk/AEGS-v6.0-titan.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

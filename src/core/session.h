@@ -25,6 +25,7 @@
 struct SessionIdentity {
     std::string           key_id_hex;
     uint64_t              key_id_raw = 0;
+    uint64_t              base_key_id_raw = 0; // Base subscription key ID for balanced multi-device slots
     std::atomic<uint64_t> session_id{0};
     std::atomic<uint64_t> generation{1}; // Lifecycle generation counter (Phase 18)
 };
@@ -50,6 +51,7 @@ struct SessionRouting {
     bool               has_client = false;
     int                last_server_fd = -1;
     bool               uses_mimicry = false; // RFC 9000 QUIC DPI camouflage active
+    uint8_t            mimic_type = 0;       // 0 = none, 1 = QUIC Initial, 2 = TLS 1.3 AppData (Factor A)
     bool               uses_alt_mask = false; // Dual-compatibility with "aegs-v2-header-mask" clients
 };
 

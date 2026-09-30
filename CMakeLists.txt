@@ -119,22 +119,25 @@ target_link_libraries(aegs_server PRIVATE OpenSSL::Crypto ${SQLITE3_LIBRARIES} T
 add_executable(aegs_client src/client.cpp ${CORE_SOURCES})
 target_link_libraries(aegs_client PRIVATE OpenSSL::Crypto Threads::Threads)
 
-# 3. Test Runner
-add_executable(aegs_test tests/unit/test_runner.cpp ${CORE_SOURCES})
-target_link_libraries(aegs_test PRIVATE OpenSSL::Crypto Threads::Threads)
+# Tests and Benchmarks (compiled only when tests/ directory is present)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_runner.cpp")
+    # 3. Test Runner
+    add_executable(aegs_test tests/unit/test_runner.cpp ${CORE_SOURCES})
+    target_link_libraries(aegs_test PRIVATE OpenSSL::Crypto Threads::Threads)
 
-# 4. Benchmark Suite
-add_executable(bench_hotpath tests/benchmarks/bench_hotpath.cpp ${STEALTH_SOURCES} src/net/network_security.cpp)
-target_link_libraries(bench_hotpath PRIVATE OpenSSL::Crypto Threads::Threads)
+    # 4. Benchmark Suite
+    add_executable(bench_hotpath tests/benchmarks/bench_hotpath.cpp ${STEALTH_SOURCES} src/net/network_security.cpp)
+    target_link_libraries(bench_hotpath PRIVATE OpenSSL::Crypto Threads::Threads)
 
-# 5. Protocol Fuzz Target
-add_executable(aegs_fuzz tests/fuzz/fuzz_parsers.cpp ${STEALTH_SOURCES} src/net/network_security.cpp)
-target_link_libraries(aegs_fuzz PRIVATE OpenSSL::Crypto Threads::Threads)
+    # 5. Protocol Fuzz Target
+    add_executable(aegs_fuzz tests/fuzz/fuzz_parsers.cpp ${STEALTH_SOURCES} src/net/network_security.cpp)
+    target_link_libraries(aegs_fuzz PRIVATE OpenSSL::Crypto Threads::Threads)
 
-# 6. Concurrency Stress Test Suite
-add_executable(test_concurrency_stress tests/test_concurrency_stress.cpp src/crypto/handshake.cpp src/net/ip_pool.cpp ${STEALTH_SOURCES} src/net/network_security.cpp)
-target_link_libraries(test_concurrency_stress PRIVATE OpenSSL::Crypto Threads::Threads)
+    # 6. Concurrency Stress Test Suite
+    add_executable(test_concurrency_stress tests/test_concurrency_stress.cpp src/crypto/handshake.cpp src/net/ip_pool.cpp ${STEALTH_SOURCES} src/net/network_security.cpp)
+    target_link_libraries(test_concurrency_stress PRIVATE OpenSSL::Crypto Threads::Threads)
 
-# 7. Multicore Scaling Benchmark
-add_executable(bench_multicore tests/benchmarks/bench_multicore.cpp src/crypto/handshake.cpp src/net/ip_pool.cpp ${STEALTH_SOURCES} src/net/network_security.cpp)
-target_link_libraries(bench_multicore PRIVATE OpenSSL::Crypto Threads::Threads)
+    # 7. Multicore Scaling Benchmark
+    add_executable(bench_multicore tests/benchmarks/bench_multicore.cpp src/crypto/handshake.cpp src/net/ip_pool.cpp ${STEALTH_SOURCES} src/net/network_security.cpp)
+    target_link_libraries(bench_multicore PRIVATE OpenSSL::Crypto Threads::Threads)
+endif()

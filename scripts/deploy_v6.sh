@@ -91,7 +91,7 @@ iptables -A INPUT -p udp --dport ${AEGS_PORT}:$((AEGS_PORT + AEGS_PORT_COUNT - 1
 echo -e "${GREEN}[6/6] Creating systemd service (aegs-server.service)...${NC}"
 cat << EOF > /etc/systemd/system/aegs-server.service
 [Unit]
-Description=AEGS v6 Titan High-Speed Stealth VPN Server
+Description=AEGS v6 Titan High-Speed Secure Overlay Protocol Server
 After=network.target
 
 [Service]
