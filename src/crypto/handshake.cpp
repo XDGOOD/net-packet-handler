@@ -300,19 +300,6 @@ bool HandshakeServer::process_init(const uint8_t* init, size_t len, uint64_t& ke
 
     memcpy(&key_id_out, &init[8], 8);
 
-    // FIX CRIT-1: Look up user's MasterKey by KeyID for MAC verification.
-    auto mk_it = m_master_keys.find(key_id_out);
-    if (mk_it == m_master_keys.end()) {
-        char kh[17]; for (int i = 0; i < 8; ++i) sprintf(&kh[i*2], "%02x", ((uint8_t*)&key_id_out)[i]); kh[16] = 0;
-        std::cerr << "[HS] Unknown KeyID: " << kh << "\n";
-        return false; // Unknown KeyID
-    }
-    auto mac = compute_mac(init, 56, mk_it->second.data(), mk_it->second.size());
-    if (CRYPTO_memcmp(mac.data(), &init[56], 16) != 0) {
-        std::cerr << "[HS] Invalid HMAC on Handshake Init\n";
-        return false;
-    }
-
     uint64_t ts;
     memcpy(&ts, &init[48], 8);
     ts = be64toh_compat(ts);
@@ -327,6 +314,20 @@ bool HandshakeServer::process_init(const uint8_t* init, size_t len, uint64_t& ke
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
+
+    // FIX CRIT-1: Look up user's MasterKey by KeyID for MAC verification.
+    auto mk_it = m_master_keys.find(key_id_out);
+    if (mk_it == m_master_keys.end()) {
+        char kh[17]; for (int i = 0; i < 8; ++i) sprintf(&kh[i*2], "%02x", ((uint8_t*)&key_id_out)[i]); kh[16] = 0;
+        std::cerr << "[HS] Unknown KeyID: " << kh << "\n";
+        return false; // Unknown KeyID
+    }
+    auto mac = compute_mac(init, 56, mk_it->second.data(), mk_it->second.size());
+    if (CRYPTO_memcmp(mac.data(), &init[56], 16) != 0) {
+        std::cerr << "[HS] Invalid HMAC on Handshake Init\n";
+        return false;
+    }
+
     prune_timestamps(now);
     prune_pending(now); // O(1) clean stale pending states
 
@@ -461,6 +462,30 @@ std::vector<uint8_t> HandshakeServer::build_resp(uint64_t key_id, uint32_t assig
     EVP_CIPHER_CTX_free(ctx);
 
     return resp;
+}
+
+void HandshakeServer::add_user(uint64_t key_id, const std::string& key_id_hex, const std::vector<uint8_t>& master_key) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_user_map[key_id] = key_id_hex;
+    m_master_keys[key_id] = master_key;
+}
+
+void HandshakeServer::remove_user(uint64_t key_id) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_user_map.erase(key_id);
+    m_master_keys.erase(key_id);
+    auto it = m_pending_clients.find(key_id);
+    if (it != m_pending_clients.end()) {
+        if (it->second.client_ephemeral_pkey) {
+            EVP_PKEY_free(it->second.client_ephemeral_pkey);
+        }
+        m_pending_clients.erase(it);
+    }
+}
+
+bool HandshakeServer::has_user(uint64_t key_id) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_master_keys.find(key_id) != m_master_keys.end();
 }
 
 

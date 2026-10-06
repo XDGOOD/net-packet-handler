@@ -1133,6 +1133,180 @@ void worker_loop(int worker_id, int num_workers, const AegsConfig& cfg,
     close(epoll_fd);
 }
 
+// Dynamic Zero-Downtime Hot-Reload State
+static std::mutex g_db_sync_mu;
+static std::unordered_map<std::string, uint64_t> g_active_tokens; // token -> base_kid_raw
+static time_t g_last_db_mtime = 0;
+
+static uint64_t register_device_session_helper(const std::string& token, const std::string& custom_kid_hex = "") {
+    std::string kid_hex;
+    uint64_t kid_raw = 0;
+    if (!custom_kid_hex.empty()) {
+        kid_hex = custom_kid_hex;
+        for (int k = 0; k < 8; ++k) {
+            unsigned int b = 0;
+            std::sscanf(kid_hex.c_str() + (k * 2), "%02x", &b);
+            ((uint8_t*)&kid_raw)[k] = (uint8_t)b;
+        }
+    } else {
+        uint8_t raw[8];
+        compute_key_id(token, raw, kid_hex);
+        std::memcpy(&kid_raw, raw, 8);
+    }
+
+    if (g_sessions.find_by_key_id(kid_raw)) {
+        return kid_raw;
+    }
+
+    Session* s = new Session();
+    s->identity.key_id_hex = kid_hex;
+    s->identity.key_id_raw = kid_raw;
+
+    uint8_t mkey[32];
+    uint8_t msk[32];
+    uint8_t alt_msk[32];
+    if (!derive_master_key(token, s->identity.key_id_hex, mkey) ||
+        !hkdf_expand(mkey, 32, "aegis-v2-header-mask", msk, 32)) {
+        std::cerr << "[AEGS] Key derivation / HKDF failed for " << s->identity.key_id_hex << "\n";
+        delete s;
+        return 0;
+    }
+    bool has_alt = hkdf_expand(mkey, 32, "aegs-v2-header-mask", alt_msk, 32);
+    SessionCrypto init_sc;
+    std::memcpy(init_sc.master_key, mkey, 32);
+    std::memcpy(init_sc.mask_key, msk, 32);
+    if (has_alt) {
+        std::memcpy(init_sc.alt_mask_key, alt_msk, 32);
+        init_sc.has_alt_mask_key = true;
+    }
+    init_sc.v3_handshake_done = false;
+    s->set_crypto(init_sc);
+    s->counters.last_activity.store(std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
+    g_sessions.insert_session(s);
+    return kid_raw;
+}
+
+static void sync_users_from_db(const std::string& db_path, HandshakeServer& hs_server, IpPool& ip_pool) {
+    std::lock_guard<std::mutex> lock(g_db_sync_mu);
+    struct stat st;
+    if (stat(db_path.c_str(), &st) != 0) {
+        return; // DB file does not exist yet or cannot be read
+    }
+    if (st.st_mtime == g_last_db_mtime && g_last_db_mtime != 0) {
+        return; // File unmodified since last sync
+    }
+
+    sqlite3* db = nullptr;
+    if (sqlite3_open_v2(db_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return;
+    }
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT aegis_key_id, aegis_token FROM users", -1, &stmt, nullptr) != SQLITE_OK) {
+        sqlite3_close(db);
+        return;
+    }
+
+    std::unordered_map<std::string, std::string> current_db_users; // token -> kid_hex
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char* kid = (const char*)sqlite3_column_text(stmt, 0);
+        const char* tok = (const char*)sqlite3_column_text(stmt, 1);
+        if (kid && tok) {
+            current_db_users[std::string(tok)] = std::string(kid);
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    g_last_db_mtime = st.st_mtime;
+
+    // 1. Detect and register new users
+    int added_count = 0;
+    for (const auto& [token, base_kid_hex] : current_db_users) {
+        if (g_active_tokens.find(token) == g_active_tokens.end()) {
+            std::vector<uint64_t> slots;
+            uint64_t k1 = register_device_session_helper(token, base_kid_hex);
+            if (k1) {
+                slots.push_back(k1);
+                Session* s = g_sessions.find_by_key_id(k1);
+                if (s) {
+                    auto sc = s->get_crypto();
+                    if (sc) {
+                        hs_server.add_user(k1, s->identity.key_id_hex, std::vector<uint8_t>(sc->master_key, sc->master_key + 32));
+                    }
+                }
+            }
+
+            uint64_t k_slot1 = register_device_session_helper(token + "#1");
+            if (k_slot1 && k_slot1 != k1) {
+                slots.push_back(k_slot1);
+                Session* s = g_sessions.find_by_key_id(k_slot1);
+                if (s) {
+                    auto sc = s->get_crypto();
+                    if (sc) {
+                        hs_server.add_user(k_slot1, s->identity.key_id_hex, std::vector<uint8_t>(sc->master_key, sc->master_key + 32));
+                    }
+                }
+            }
+
+            for (int slot = 2; slot <= 4; ++slot) {
+                uint64_t ks = register_device_session_helper(token + "#" + std::to_string(slot));
+                if (ks) {
+                    slots.push_back(ks);
+                    Session* s = g_sessions.find_by_key_id(ks);
+                    if (s) {
+                        auto sc = s->get_crypto();
+                        if (sc) {
+                            hs_server.add_user(ks, s->identity.key_id_hex, std::vector<uint8_t>(sc->master_key, sc->master_key + 32));
+                        }
+                    }
+                }
+            }
+
+            if (k1) {
+                g_user_slots[k1] = slots;
+                g_active_tokens[token] = k1;
+                added_count++;
+            }
+        }
+    }
+
+    // 2. Detect and remove revoked users
+    int removed_count = 0;
+    std::vector<std::string> tokens_to_remove;
+    for (const auto& [token, base_kid] : g_active_tokens) {
+        if (current_db_users.find(token) == current_db_users.end()) {
+            tokens_to_remove.push_back(token);
+        }
+    }
+
+    for (const auto& tok : tokens_to_remove) {
+        uint64_t base_kid = g_active_tokens[tok];
+        auto slot_it = g_user_slots.find(base_kid);
+        if (slot_it != g_user_slots.end()) {
+            for (uint64_t kid : slot_it->second) {
+                hs_server.remove_user(kid);
+                Session* s = g_sessions.find_by_key_id(kid);
+                if (s) {
+                    uint32_t assigned_ip = s->assigned_ip.load(std::memory_order_relaxed);
+                    if (assigned_ip != 0) {
+                        ip_pool.release(assigned_ip);
+                    }
+                    g_sessions.remove_session(kid);
+                }
+            }
+            g_user_slots.erase(slot_it);
+        }
+        g_active_tokens.erase(tok);
+        removed_count++;
+    }
+
+    if (added_count > 0 || removed_count > 0) {
+        std::cout << "[AEGS Hot-Reload] Synchronized database: +" << added_count << " active user(s), -" << removed_count << " revoked user(s).\n";
+    }
+}
+
 int main() {
 #ifndef _WIN32
     setlinebuf(stdout);
@@ -1150,105 +1324,7 @@ int main() {
 #ifndef _WIN32
     chmod(cfg.db_path.c_str(), 0600);
 #endif
-    sqlite3* db;
-    if (sqlite3_open(cfg.db_path.c_str(), &db) == SQLITE_OK) {
-#ifndef _WIN32
-        chmod(cfg.db_path.c_str(), 0600);
-#endif
-        sqlite3_stmt* stmt;
-        if (sqlite3_prepare_v2(db, "SELECT aegis_key_id, aegis_token FROM users", -1, &stmt, NULL) == SQLITE_OK) {
-            auto register_device_session = [&](const std::string& token, const std::string& custom_kid_hex = "") -> uint64_t {
-                std::string kid_hex;
-                uint64_t kid_raw = 0;
-                if (!custom_kid_hex.empty()) {
-                    kid_hex = custom_kid_hex;
-                    for (int k = 0; k < 8; ++k) {
-                        unsigned int b = 0;
-                        std::sscanf(kid_hex.c_str() + (k * 2), "%02x", &b);
-                        ((uint8_t*)&kid_raw)[k] = (uint8_t)b;
-                    }
-                } else {
-                    uint8_t raw[8];
-                    compute_key_id(token, raw, kid_hex);
-                    std::memcpy(&kid_raw, raw, 8);
-                }
 
-                if (g_sessions.find_by_key_id(kid_raw)) {
-                    return kid_raw;
-                }
-
-                Session* s = new Session();
-                s->identity.key_id_hex = kid_hex;
-                s->identity.key_id_raw = kid_raw;
-
-                uint8_t mkey[32];
-                uint8_t msk[32];
-                uint8_t alt_msk[32];
-                if (!derive_master_key(token, s->identity.key_id_hex, mkey) ||
-                    !hkdf_expand(mkey, 32, "aegis-v2-header-mask", msk, 32)) {
-                    std::cerr << "key derivation / HKDF failed for " << s->identity.key_id_hex << "\n";
-                    delete s;
-                    return 0;
-                }
-                bool has_alt = hkdf_expand(mkey, 32, "aegs-v2-header-mask", alt_msk, 32);
-                SessionCrypto init_sc;
-                std::memcpy(init_sc.master_key, mkey, 32);
-                std::memcpy(init_sc.mask_key, msk, 32);
-                if (has_alt) {
-                    std::memcpy(init_sc.alt_mask_key, alt_msk, 32);
-                    init_sc.has_alt_mask_key = true;
-                }
-                init_sc.v3_handshake_done = false;
-                s->set_crypto(init_sc);
-                s->counters.last_activity.store(std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
-                g_sessions.insert_session(s);
-                return kid_raw;
-            };
-
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                std::string base_kid_hex = (const char*)sqlite3_column_text(stmt, 0);
-                std::string base_token = (const char*)sqlite3_column_text(stmt, 1);
-
-                std::vector<uint64_t> slots;
-                uint64_t k1 = register_device_session(base_token, base_kid_hex);
-                if (k1) slots.push_back(k1);
-                register_device_session(base_token + "#1");
-
-                for (int slot = 2; slot <= 4; ++slot) {
-                    uint64_t ks = register_device_session(base_token + "#" + std::to_string(slot));
-                    if (ks) slots.push_back(ks);
-                }
-                if (k1) {
-                    g_user_slots[k1] = slots;
-                }
-            }
-            sqlite3_finalize(stmt);
-        } else {
-            std::cerr << "failed to prepare user query: " << sqlite3_errmsg(db) << "\n";
-        }
-        sqlite3_close(db);
-    } else {
-        std::cerr << "failed to open db at " << cfg.db_path << ": " << sqlite3_errmsg(db) << "\n";
-        return 1;
-    }
-
-    if (g_sessions.total_sessions() == 0) {
-        std::cerr << "no sessions loaded from db, nothing to serve\n";
-        return 1;
-    }
-    
-    std::unordered_map<uint64_t, std::string> user_map;
-    std::unordered_map<uint64_t, std::vector<uint8_t>> master_key_map;
-    g_sessions.for_each_session([&](Session* s) {
-        uint64_t kid = s->identity.key_id_raw;
-        user_map[kid] = s->identity.key_id_hex;
-        auto sc = s->get_crypto();
-        if (sc) {
-            master_key_map[kid] = std::vector<uint8_t>(
-                sc->master_key, sc->master_key + 32);
-        }
-    });
-    
     TunInterface tun(cfg.tun_name, cfg.tun_addr(), cfg.mtu);
     if (!tun.open()) {
         std::cerr << "[AEGS v6 Titan Server] Failed to create TUN interface aegs0\n";
@@ -1265,7 +1341,13 @@ int main() {
     }
 
     IpPool ip_pool("10.8.0.0/24");
-    HandshakeServer hs_server(user_map, master_key_map);
+    std::unordered_map<uint64_t, std::string> empty_user_map;
+    std::unordered_map<uint64_t, std::vector<uint8_t>> empty_key_map;
+    HandshakeServer hs_server(empty_user_map, empty_key_map);
+
+    // Initial sync from SQLite database:
+    sync_users_from_db(cfg.db_path, hs_server, ip_pool);
+    std::cout << "[AEGS v6 Titan Server] Active sessions loaded: " << g_sessions.total_sessions() << " device slot(s)\n";
     auto server_pubkey = hs_server.get_pubkey();
 
     TrafficShaper shaper(5, false);
@@ -1292,13 +1374,14 @@ int main() {
               << (num_workers > 1 ? " (SO_REUSEPORT active)" : "")
               << ", Batch size: " << cfg.recv_batch_size << "\n";
 
-    // Dedicated Control-Plane GC Thread: offloads cleanup, token expiry, and rate-limit maintenance
+    // Dedicated Control-Plane GC Thread: offloads cleanup, token expiry, rate-limit and dynamic user synchronization
     std::thread gc_thread([&]() {
         while (g_running.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
             if (!g_running.load(std::memory_order_relaxed)) break;
             double now = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
             cleanup_maps(now, ip_pool);
+            sync_users_from_db(cfg.db_path, hs_server, ip_pool);
         }
     });
 
